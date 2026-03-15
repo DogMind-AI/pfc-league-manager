@@ -13,6 +13,8 @@ Multi-division youth soccer league dashboard with:
 - upset probability model
 - projected table insights
 - upcoming match predictions
+- schedule manager (add games, reschedule, mark canceled/bye/played)
+- password-protected admin editing
 - PDF / PNG / CSV exports
 """
 
@@ -46,6 +48,7 @@ st.set_page_config(
 
 DB_PATH = "league.db"
 DIVISIONS = ["U15 Boys", "U15 Girls"]
+ADMIN_PASSWORD = "cobras2026"   # ← change this to whatever you want
 
 DEFAULT_TEAMS = {
     "U15 Boys": [
@@ -79,6 +82,7 @@ TEAM_NAME_ALIASES = {
 
 def normalize_team_name(name):
     return TEAM_NAME_ALIASES.get(name, name)
+
 DEFAULT_RESULTS = {
     "U15 Boys": [
         ("U15 Boys", 1, "2025-01-01", "Cobras", "Athletico", 3, 2, "Week 1 opener"),
@@ -168,6 +172,7 @@ PFC_RED = "#C0392B"
 PFC_GOLD = "#D4AF37"
 PFC_AMBER = "#D99100"
 PFC_DARK = "#0F1B3D"
+PFC_ORANGE = "#E67E22"
 
 # ─────────────────────────────────────────────
 # DATE / LOGO HELPERS
@@ -307,6 +312,22 @@ def init_db():
         )
     """)
 
+    # ── NEW: schedule table ──────────────────────────────────────────────
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS schedule (
+            id         INTEGER PRIMARY KEY AUTOINCREMENT,
+            division   TEXT NOT NULL,
+            week       INTEGER NOT NULL,
+            game_date  TEXT NOT NULL,
+            home_team  TEXT NOT NULL,
+            away_team  TEXT NOT NULL,
+            location   TEXT DEFAULT '',
+            time       TEXT DEFAULT '',
+            status     TEXT DEFAULT 'scheduled',
+            notes      TEXT DEFAULT ''
+        )
+    """)
+    # status values: 'scheduled' | 'canceled' | 'bye'
     conn.commit()
 
     if not column_exists(conn, "matches", "division"):
@@ -339,6 +360,31 @@ def init_db():
                 """,
                 rows,
             )
+            conn.commit()
+
+    # Seed schedule table from SCHEDULE_ROWS if empty
+    for division, rows in SCHEDULE_ROWS.items():
+        count = c.execute(
+            "SELECT COUNT(*) FROM schedule WHERE division=?",
+            (division,),
+        ).fetchone()[0]
+        if count == 0:
+            for row in rows:
+                c.execute(
+                    """
+                    INSERT INTO schedule (division, week, game_date, home_team, away_team, location, time, status, notes)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, 'scheduled', '')
+                    """,
+                    (
+                        division,
+                        row["week"],
+                        to_iso_date(row["game_date"]),
+                        row["home_team"],
+                        row["away_team"],
+                        row.get("location", ""),
+                        row.get("time", ""),
+                    ),
+                )
             conn.commit()
 
     conn.close()
@@ -378,6 +424,15 @@ def rename_team(division: str, old_name: str, new_name: str):
     )
     conn.execute(
         "UPDATE matches SET away_team=? WHERE division=? AND away_team=?",
+        (new_name, division, old_name),
+    )
+    # Also update schedule table
+    conn.execute(
+        "UPDATE schedule SET home_team=? WHERE division=? AND home_team=?",
+        (new_name, division, old_name),
+    )
+    conn.execute(
+        "UPDATE schedule SET away_team=? WHERE division=? AND away_team=?",
         (new_name, division, old_name),
     )
     conn.commit()
@@ -500,6 +555,78 @@ def delete_note(note_id):
     conn.execute("DELETE FROM league_notes WHERE id=?", (note_id,))
     conn.commit()
     conn.close()
+
+
+# ─────────────────────────────────────────────
+# SCHEDULE DB FUNCTIONS
+# ─────────────────────────────────────────────
+def load_schedule_from_db(division: str) -> pd.DataFrame:
+    """Load full schedule from DB (all statuses)."""
+    conn = get_conn()
+    df = pd.read_sql_query(
+        "SELECT * FROM schedule WHERE division=? ORDER BY week, game_date, time, home_team",
+        conn,
+        params=(division,),
+    )
+    conn.close()
+    if not df.empty:
+        df["game_date"] = df["game_date"].astype(str)
+    return df
+
+
+def load_schedule_df(division: str) -> pd.DataFrame:
+    """Load only 'scheduled' games for predictions — excludes canceled, bye, and played."""
+    df = load_schedule_from_db(division)
+    if df.empty:
+        return pd.DataFrame(columns=["week", "game_date", "home_team", "away_team", "location", "time"])
+    active = df[df["status"] == "scheduled"].copy()
+    return active.sort_values(["week", "game_date", "time", "home_team"]).reset_index(drop=True)
+
+
+def insert_schedule_game(division, week, game_date, home, away, location, time_str, notes=""):
+    conn = get_conn()
+    conn.execute(
+        """
+        INSERT INTO schedule (division, week, game_date, home_team, away_team, location, time, status, notes)
+        VALUES (?, ?, ?, ?, ?, ?, ?, 'scheduled', ?)
+        """,
+        (division, int(week), to_iso_date(game_date), home, away, location.strip(), time_str.strip(), notes.strip()),
+    )
+    conn.commit()
+    conn.close()
+
+
+def update_schedule_game(game_id, week, game_date, home, away, location, time_str, status, notes):
+    conn = get_conn()
+    conn.execute(
+        """
+        UPDATE schedule
+        SET week=?, game_date=?, home_team=?, away_team=?, location=?, time=?, status=?, notes=?
+        WHERE id=?
+        """,
+        (int(week), to_iso_date(game_date), home, away, location.strip(), time_str.strip(), status, notes.strip(), int(game_id)),
+    )
+    conn.commit()
+    conn.close()
+
+
+def delete_schedule_game(game_id):
+    conn = get_conn()
+    conn.execute("DELETE FROM schedule WHERE id=?", (int(game_id),))
+    conn.commit()
+    conn.close()
+
+
+def set_game_status(game_id: int, status: str, notes: str = ""):
+    """Quickly flip a game's status (scheduled/canceled/bye)."""
+    conn = get_conn()
+    conn.execute(
+        "UPDATE schedule SET status=?, notes=? WHERE id=?",
+        (status, notes.strip(), int(game_id)),
+    )
+    conn.commit()
+    conn.close()
+
 
 # ─────────────────────────────────────────────
 # ANALYTICS
@@ -836,16 +963,8 @@ def compute_current_metrics(df: pd.DataFrame, teams: list[str]):
     return pr_map, analytics_map
 
 
-def load_schedule_df(division: str) -> pd.DataFrame:
-    rows = SCHEDULE_ROWS.get(division, [])
-    if not rows:
-        return pd.DataFrame(columns=["week", "game_date", "home_team", "away_team", "location", "time"])
-    sched = pd.DataFrame(rows)
-    sched["game_date"] = sched["game_date"].apply(to_iso_date)
-    return sched.sort_values(["week", "game_date", "time", "home_team"]).reset_index(drop=True)
-
-
 def compute_upcoming_predictions(df: pd.DataFrame, division: str, teams: list[str]) -> pd.DataFrame:
+    # Uses load_schedule_df which now reads from DB and filters to 'scheduled' only
     schedule_df = load_schedule_df(division)
     if schedule_df.empty:
         return schedule_df
@@ -863,8 +982,6 @@ def compute_upcoming_predictions(df: pd.DataFrame, division: str, teams: list[st
 
     if upcoming.empty:
         return upcoming
-
-
 
     pr_map, analytics_map = compute_current_metrics(df, teams)
 
@@ -967,6 +1084,17 @@ def prep_match_display(df: pd.DataFrame) -> pd.DataFrame:
     out = df.copy()
     out["game_date"] = out["game_date"].apply(format_display_date)
     return out
+
+
+def status_badge(status: str) -> str:
+    if status == "canceled":
+        return f'<span style="background:{PFC_RED};color:white;padding:2px 8px;border-radius:6px;font-size:11px;font-weight:700;">CANCELED</span>'
+    elif status == "bye":
+        return f'<span style="background:{PFC_ORANGE};color:white;padding:2px 8px;border-radius:6px;font-size:11px;font-weight:700;">BYE</span>'
+    elif status == "played":
+        return f'<span style="background:{PFC_SILVER};color:white;padding:2px 8px;border-radius:6px;font-size:11px;font-weight:700;">PLAYED</span>'
+    return f'<span style="background:{PFC_GREEN};color:white;padding:2px 8px;border-radius:6px;font-size:11px;font-weight:700;">SCHEDULED</span>'
+
 
 # ─────────────────────────────────────────────
 # EXPORT HELPERS
@@ -1189,7 +1317,6 @@ def inject_css():
             color: white !important;
         }}
 
-        /* clearer division selector */
         [data-testid="stSidebar"] .stRadio label {{
             background: rgba(255,255,255,0.08);
             border: 1px solid rgba(255,255,255,0.15);
@@ -1282,59 +1409,327 @@ def inject_css():
             margin-top: 6px;
             margin-bottom: 10px;
         }}
+
+        .sched-row-played {{
+            background: #F4F4F6;
+            border-left: 4px solid {PFC_SILVER};
+            border-radius: 8px;
+            padding: 10px 14px;
+            margin: 6px 0;
+            opacity: 0.70;
+        }}
+
+        .sched-row-canceled {{
+            background: #FFF0EE;
+            border-left: 4px solid {PFC_RED};
+            border-radius: 8px;
+            padding: 10px 14px;
+            margin: 6px 0;
+            opacity: 0.75;
+        }}
+
+        .sched-row-bye {{
+            background: #FFF6E8;
+            border-left: 4px solid {PFC_ORANGE};
+            border-radius: 8px;
+            padding: 10px 14px;
+            margin: 6px 0;
+            opacity: 0.80;
+        }}
+
+        .sched-row-scheduled {{
+            background: #F0FAF4;
+            border-left: 4px solid {PFC_GREEN};
+            border-radius: 8px;
+            padding: 10px 14px;
+            margin: 6px 0;
+        }}
         </style>
         """,
         unsafe_allow_html=True,
     )
 
 # ─────────────────────────────────────────────
+# ADMIN AUTH
+# ─────────────────────────────────────────────
+def is_admin() -> bool:
+    return st.session_state.get("admin_unlocked", False)
+
+
+def render_admin_sidebar():
+    """Renders the lock/unlock widget in the sidebar."""
+    st.sidebar.divider()
+    if is_admin():
+        st.sidebar.markdown(
+            f'<div style="background:rgba(46,139,87,0.25);border:1px solid {PFC_GREEN};border-radius:10px;'
+            f'padding:8px 12px;text-align:center;font-weight:700;color:white;">🔓 Admin Mode</div>',
+            unsafe_allow_html=True,
+        )
+        if st.sidebar.button("🔒 Lock Admin", key="lock_btn", use_container_width=True):
+            st.session_state["admin_unlocked"] = False
+            st.rerun()
+    else:
+        st.sidebar.markdown(
+            f'<div style="background:rgba(255,255,255,0.08);border:1px solid rgba(255,255,255,0.20);'
+            f'border-radius:10px;padding:8px 12px;text-align:center;font-weight:700;color:white;">🔒 View-Only Mode</div>',
+            unsafe_allow_html=True,
+        )
+        with st.sidebar.form("admin_login_form", clear_on_submit=True):
+            pw = st.text_input("Admin Password", type="password", label_visibility="collapsed",
+                               placeholder="Enter admin password")
+            login = st.form_submit_button("Unlock", use_container_width=True)
+        if login:
+            if pw == ADMIN_PASSWORD:
+                st.session_state["admin_unlocked"] = True
+                st.rerun()
+            else:
+                st.sidebar.error("Incorrect password.")
+
+
+def require_admin(label: str = "this action"):
+    """Call at the top of any edit page/section. Shows a warning and returns False if not admin."""
+    if not is_admin():
+        st.warning(f"🔒 Admin access required to {label}. Use the sidebar to unlock.")
+        return False
+    return True
+
+
+# ─────────────────────────────────────────────
 # PAGES
 # ─────────────────────────────────────────────
-def page_score_entry(df, division: str, teams: list[str]):
-    st.markdown('<div class="section-header">📝 Score Entry & Match Management</div>', unsafe_allow_html=True)
+def page_game_manager(df, division: str, teams: list[str]):
+    """
+    Unified Game Manager — schedule is the source of truth.
+    Every game row has inline actions: enter score, cancel, reschedule.
+    Separate tab for adding new games.
+    Logged match results are editable/deletable in a dedicated tab.
+    """
+    st.markdown('<div class="section-header">📋 Game Manager</div>', unsafe_allow_html=True)
 
-    tab_add, tab_manage = st.tabs(["Add Match", "Edit / Delete Match"])
+    sched_df = load_schedule_from_db(division)
 
-    with tab_add:
-        with st.form(f"match_form_{division}", clear_on_submit=True):
-            col1, col2, col3 = st.columns(3)
-            with col1:
-                default_week = int(df["week"].max()) if not df.empty else 1
-                week = st.number_input("Week", min_value=1, max_value=52, value=default_week, step=1)
-                game_date = st.date_input("Game Date", value=date.today(), format="MM/DD/YYYY")
-            with col2:
-                home_team = st.selectbox("Home Team", teams, key=f"add_home_{division}")
-                home_goals = st.number_input("Home Goals", min_value=0, max_value=30, value=0, step=1)
-            with col3:
-                away_team = st.selectbox("Away Team", teams, key=f"add_away_{division}")
-                away_goals = st.number_input("Away Goals", min_value=0, max_value=30, value=0, step=1)
+    # Build a lookup: (game_date, home_team, away_team) → match result row
+    completed_map = {}
+    for _, mr in df.iterrows():
+        key = (str(mr["game_date"]), str(mr["home_team"]), str(mr["away_team"]))
+        completed_map[key] = mr
 
-            notes = st.text_input("Notes (optional)", placeholder="e.g. Rain delay, rescheduled, forfeit")
-            submitted = st.form_submit_button("⚽ Save Match", width="stretch")
+    admin = is_admin()
 
-        if submitted:
-            if home_team == away_team:
-                st.error("A team cannot play itself.")
-            elif match_exists(division, week, game_date, home_team, away_team, home_goals, away_goals):
-                st.warning("That exact match/result already exists. No duplicate was added.")
+    tab_schedule, tab_add, tab_edit_results = st.tabs([
+        "📅 Schedule & Score Entry",
+        "➕ Add New Game",
+        "✏️ Edit / Delete Results",
+    ])
+
+    # ── TAB 1: Schedule — main workhorse ─────────────────────────────────
+    with tab_schedule:
+        if sched_df.empty:
+            st.info("No schedule loaded yet.")
+        else:
+            st.markdown(
+                f"""
+                <div class="info-strip">
+                <b>Legend:</b>
+                &nbsp;<span style="color:{PFC_GREEN};font-weight:700;">● Scheduled</span>
+                &nbsp;&nbsp;<span style="color:{PFC_SILVER};font-weight:700;">● Played</span>
+                &nbsp;&nbsp;<span style="color:{PFC_RED};font-weight:700;">● Canceled</span>
+                &nbsp;&nbsp;<span style="color:{PFC_ORANGE};font-weight:700;">● Bye</span>
+                {"&nbsp;&nbsp;— Click a game row to take action on it." if admin else "&nbsp;&nbsp;— Unlock admin in the sidebar to make changes."}
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
+
+            # Week filter
+            weeks = ["All"] + sorted(sched_df["week"].unique().tolist())
+            col_wf, col_sf = st.columns([1, 1])
+            with col_wf:
+                sel_week = st.selectbox("Filter by Week", weeks, key="gm_week_filter")
+            with col_sf:
+                sel_status = st.selectbox(
+                    "Filter by Status",
+                    ["All", "scheduled", "played", "canceled", "bye"],
+                    key="gm_status_filter",
+                )
+
+            view_df = sched_df.copy()
+            if sel_week != "All":
+                view_df = view_df[view_df["week"] == int(sel_week)]
+            if sel_status != "All":
+                view_df = view_df[view_df["status"] == sel_status]
+
+            if view_df.empty:
+                st.info("No games match the selected filters.")
             else:
-                insert_match(division, week, game_date, home_team, away_team, home_goals, away_goals, notes)
-                st.success(f"Saved: {home_team} {home_goals} – {away_goals} {away_team} ({division}, Week {week})")
+                for _, row in view_df.iterrows():
+                    game_id = int(row["id"])
+                    status = row["status"]
+                    css_class = f"sched-row-{status}"
+                    badge = status_badge(status)
+                    note_str = f" — <i>{row['notes']}</i>" if row.get("notes") else ""
+
+                    # Check if a result is already logged for this game
+                    result_key = (str(row["game_date"]), str(row["home_team"]), str(row["away_team"]))
+                    result_row = completed_map.get(result_key)
+                    score_str = ""
+                    if result_row is not None:
+                        score_str = f"&nbsp;&nbsp;<b style='color:{PFC_NAVY}'>{int(result_row['home_goals'])} – {int(result_row['away_goals'])}</b>"
+
+                    st.markdown(
+                        f"""
+                        <div class="{css_class}">
+                            <b>Wk {int(row['week'])}</b> &nbsp;·&nbsp;
+                            {format_display_date(row['game_date'])} {row['time']} &nbsp;·&nbsp;
+                            <b>{row['home_team']}</b> vs <b>{row['away_team']}</b> &nbsp;·&nbsp;
+                            {row['location']} &nbsp; {badge}{score_str}{note_str}
+                        </div>
+                        """,
+                        unsafe_allow_html=True,
+                    )
+
+                    if admin:
+                        with st.expander(f"⚙️ Actions — {row['home_team']} vs {row['away_team']} (Wk {int(row['week'])})", expanded=False):
+                            action = st.radio(
+                                "What do you want to do?",
+                                ["⚽ Enter / Update Score", "🗓️ Reschedule", "🚫 Cancel", "😴 Mark as Bye", "♻️ Restore to Scheduled"],
+                                key=f"action_{game_id}",
+                                horizontal=True,
+                            )
+
+                            if action == "⚽ Enter / Update Score":
+                                st.markdown(f"**Enter result for {row['home_team']} vs {row['away_team']}**")
+                                # Pre-fill if result already exists
+                                pre_hg = int(result_row["home_goals"]) if result_row is not None else 0
+                                pre_ag = int(result_row["away_goals"]) if result_row is not None else 0
+                                pre_notes = str(result_row["notes"]) if result_row is not None else ""
+
+                                with st.form(f"score_form_{game_id}", clear_on_submit=False):
+                                    sc1, sc2, sc3 = st.columns(3)
+                                    with sc1:
+                                        hg = st.number_input(f"{row['home_team']} Goals", min_value=0, max_value=30, value=pre_hg, step=1, key=f"hg_{game_id}")
+                                    with sc2:
+                                        ag = st.number_input(f"{row['away_team']} Goals", min_value=0, max_value=30, value=pre_ag, step=1, key=f"ag_{game_id}")
+                                    with sc3:
+                                        match_notes = st.text_input("Match Notes", value=pre_notes, placeholder="e.g. Rain delay", key=f"mnotes_{game_id}")
+
+                                    save_score = st.form_submit_button("⚽ Save Score & Mark Played", use_container_width=True)
+
+                                if save_score:
+                                    if result_row is not None:
+                                        # Update existing result
+                                        update_match(
+                                            int(result_row["id"]), division,
+                                            int(row["week"]), row["game_date"],
+                                            row["home_team"], row["away_team"],
+                                            hg, ag, match_notes,
+                                        )
+                                    else:
+                                        # Insert new result
+                                        insert_match(
+                                            division, int(row["week"]), row["game_date"],
+                                            row["home_team"], row["away_team"],
+                                            hg, ag, match_notes,
+                                        )
+                                    # Auto-mark the schedule entry as played
+                                    set_game_status(game_id, "played", "")
+                                    st.success(f"Saved: {row['home_team']} {hg} – {ag} {row['away_team']}")
+                                    st.rerun()
+
+                            elif action == "🗓️ Reschedule":
+                                st.markdown("**Move this game to a new date/time/location. Teams stay the same.**")
+                                with st.form(f"reschedule_form_{game_id}", clear_on_submit=False):
+                                    rs1, rs2 = st.columns(2)
+                                    with rs1:
+                                        new_week = st.number_input("New Week", min_value=1, max_value=52, value=int(row["week"]), step=1, key=f"rswk_{game_id}")
+                                        new_date = st.date_input("New Date", value=parse_to_date(row["game_date"]), format="MM/DD/YYYY", key=f"rsdt_{game_id}")
+                                    with rs2:
+                                        new_time = st.text_input("New Time", value=str(row["time"]), key=f"rstm_{game_id}")
+                                        new_loc = st.text_input("New Location", value=str(row["location"]), key=f"rslc_{game_id}")
+                                    rs_notes = st.text_input("Notes", value="", placeholder="e.g. Rescheduled due to rain", key=f"rsnotes_{game_id}")
+                                    save_rs = st.form_submit_button("💾 Save Reschedule", use_container_width=True)
+
+                                if save_rs:
+                                    update_schedule_game(game_id, new_week, new_date, row["home_team"], row["away_team"], new_loc, new_time, "scheduled", rs_notes)
+                                    st.success(f"Rescheduled to Week {new_week}, {format_display_date(new_date)} {new_time} @ {new_loc}")
+                                    st.rerun()
+
+                            elif action == "🚫 Cancel":
+                                with st.form(f"cancel_form_{game_id}"):
+                                    cancel_reason = st.text_input("Reason (optional)", placeholder="e.g. Field closed, weather", key=f"cancelreason_{game_id}")
+                                    confirm_cancel = st.form_submit_button("🚫 Confirm Cancellation", use_container_width=True)
+                                if confirm_cancel:
+                                    set_game_status(game_id, "canceled", cancel_reason)
+                                    st.success(f"Marked as Canceled: {row['home_team']} vs {row['away_team']}")
+                                    st.rerun()
+
+                            elif action == "😴 Mark as Bye":
+                                with st.form(f"bye_form_{game_id}"):
+                                    bye_notes = st.text_input("Notes (optional)", placeholder="e.g. Opponent no-show", key=f"byenotes_{game_id}")
+                                    confirm_bye = st.form_submit_button("😴 Confirm Bye", use_container_width=True)
+                                if confirm_bye:
+                                    set_game_status(game_id, "bye", bye_notes)
+                                    st.success(f"Marked as Bye: {row['home_team']} vs {row['away_team']}")
+                                    st.rerun()
+
+                            elif action == "♻️ Restore to Scheduled":
+                                with st.form(f"restore_form_{game_id}"):
+                                    confirm_restore = st.form_submit_button("♻️ Restore to Scheduled", use_container_width=True)
+                                if confirm_restore:
+                                    set_game_status(game_id, "scheduled", "")
+                                    st.success(f"Restored to Scheduled: {row['home_team']} vs {row['away_team']}")
+                                    st.rerun()
+
+            st.caption(f"Showing {len(view_df)} game(s).")
+
+    # ── TAB 2: Add New Game ───────────────────────────────────────────────
+    with tab_add:
+        if not require_admin("add games to the schedule"):
+            st.stop()
+
+        st.markdown("Add a makeup game, extra fixture, or any game not already on the schedule.")
+
+        with st.form("add_game_form", clear_on_submit=True):
+            a1, a2, a3 = st.columns(3)
+            with a1:
+                add_week = st.number_input("Week", min_value=1, max_value=52, value=1, step=1, key="ag_week")
+                add_date = st.date_input("Date", value=date.today(), format="MM/DD/YYYY", key="ag_date")
+            with a2:
+                add_home = st.selectbox("Home Team", teams, key="ag_home")
+                add_time = st.text_input("Time", value="9:00 AM", placeholder="e.g. 10:30 AM", key="ag_time")
+            with a3:
+                add_away = st.selectbox("Away Team", teams, key="ag_away")
+                add_location = st.text_input("Location", value="", placeholder="e.g. Field 4", key="ag_loc")
+
+            add_notes = st.text_input("Notes (optional)", placeholder="e.g. Makeup game from Week 3 cancellation", key="ag_notes")
+            add_submitted = st.form_submit_button("➕ Add Game to Schedule", use_container_width=True)
+
+        if add_submitted:
+            if add_home == add_away:
+                st.error("A team cannot play itself.")
+            else:
+                insert_schedule_game(division, add_week, add_date, add_home, add_away, add_location, add_time, add_notes)
+                st.success(f"Added: {add_home} vs {add_away} — Week {add_week}, {format_display_date(add_date)} {add_time}")
                 st.rerun()
 
-    with tab_manage:
+    # ── TAB 3: Edit / Delete logged results ──────────────────────────────
+    with tab_edit_results:
+        if not require_admin("edit or delete match results"):
+            st.stop()
+
         if df.empty:
-            st.info("No matches available to edit or delete.")
+            st.info("No results logged yet.")
         else:
-            st.markdown("#### Existing Matches")
+            st.markdown("Edit or delete a previously logged match result. This does **not** affect the schedule entry.")
+
             manage_df = prep_match_display(df.copy())
             manage_df["Score"] = manage_df["home_goals"].astype(str) + "–" + manage_df["away_goals"].astype(str)
-            match_list = manage_df[["id", "week", "game_date", "home_team", "Score", "away_team", "notes"]].copy()
-            match_list.columns = ["ID", "Week", "Date", "Home", "Score", "Away", "Notes"]
-            st.dataframe(match_list, width="stretch", hide_index=True)
+            display_list = manage_df[["id", "week", "game_date", "home_team", "Score", "away_team", "notes"]].copy()
+            display_list.columns = ["ID", "Week", "Date", "Home", "Score", "Away", "Notes"]
+            st.dataframe(display_list, use_container_width=True, hide_index=True)
 
             selected_id = st.selectbox(
-                "Select a match to edit or delete",
+                "Select a result to edit or delete",
                 manage_df["id"].tolist(),
                 format_func=lambda x: (
                     f"Wk {int(manage_df.loc[manage_df['id'] == x, 'week'].iloc[0])} | "
@@ -1343,63 +1738,50 @@ def page_score_entry(df, division: str, teams: list[str]):
                     f"{int(manage_df.loc[manage_df['id'] == x, 'home_goals'].iloc[0])}-"
                     f"{int(manage_df.loc[manage_df['id'] == x, 'away_goals'].iloc[0])} "
                     f"{manage_df.loc[manage_df['id'] == x, 'away_team'].iloc[0]}"
-                )
+                ),
+                key="edit_result_select",
             )
 
-            selected_row = manage_df[manage_df["id"] == selected_id].iloc[0]
+            sel = manage_df[manage_df["id"] == selected_id].iloc[0]
 
-            st.markdown("#### Edit Selected Match")
-            with st.form(f"edit_match_form_{division}_{selected_id}"):
-                c1, c2, c3 = st.columns(3)
-                with c1:
-                    edit_week = st.number_input("Week", min_value=1, max_value=52, value=int(selected_row["week"]), step=1, key=f"edit_week_{division}_{selected_id}")
-                    edit_date = st.date_input(
-                        "Game Date",
-                        value=parse_to_date(selected_row["game_date"]),
-                        format="MM/DD/YYYY",
-                        key=f"edit_date_{division}_{selected_id}",
-                    )
-                with c2:
-                    edit_home = st.selectbox(
-                        "Home Team",
-                        teams,
-                        index=teams.index(selected_row["home_team"]),
-                        key=f"edit_home_{division}_{selected_id}",
-                    )
-                    edit_hg = st.number_input("Home Goals", min_value=0, max_value=30, value=int(selected_row["home_goals"]), step=1, key=f"edit_hg_{division}_{selected_id}")
-                with c3:
-                    edit_away = st.selectbox(
-                        "Away Team",
-                        teams,
-                        index=teams.index(selected_row["away_team"]),
-                        key=f"edit_away_{division}_{selected_id}",
-                    )
-                    edit_ag = st.number_input("Away Goals", min_value=0, max_value=30, value=int(selected_row["away_goals"]), step=1, key=f"edit_ag_{division}_{selected_id}")
+            with st.form(f"edit_result_form_{selected_id}"):
+                ec1, ec2, ec3 = st.columns(3)
+                with ec1:
+                    e_week = st.number_input("Week", min_value=1, max_value=52, value=int(sel["week"]), step=1)
+                    e_date = st.date_input("Date", value=parse_to_date(sel["game_date"]), format="MM/DD/YYYY")
+                with ec2:
+                    e_home = st.selectbox("Home Team", teams, index=teams.index(sel["home_team"]) if sel["home_team"] in teams else 0)
+                    e_hg = st.number_input("Home Goals", min_value=0, max_value=30, value=int(sel["home_goals"]), step=1)
+                with ec3:
+                    e_away = st.selectbox("Away Team", teams, index=teams.index(sel["away_team"]) if sel["away_team"] in teams else 0)
+                    e_ag = st.number_input("Away Goals", min_value=0, max_value=30, value=int(sel["away_goals"]), step=1)
 
-                edit_notes = st.text_input("Notes", value=selected_row["notes"], key=f"edit_notes_{division}_{selected_id}")
+                e_notes = st.text_input("Notes", value=str(sel["notes"]))
+                col_sv, col_del = st.columns(2)
+                do_save = col_sv.form_submit_button("💾 Save Changes", use_container_width=True)
+                do_delete = col_del.form_submit_button("🗑️ Delete Result", use_container_width=True)
 
-                col_save, col_delete = st.columns(2)
-                save_changes = col_save.form_submit_button("💾 Save Changes", width="stretch")
-                delete_selected = col_delete.form_submit_button("🗑️ Delete Match", width="stretch")
-
-            if save_changes:
-                if edit_home == edit_away:
+            if do_save:
+                if e_home == e_away:
                     st.error("A team cannot play itself.")
-                elif match_exists(division, edit_week, edit_date, edit_home, edit_away, edit_hg, edit_ag, exclude_id=int(selected_row["id"])):
-                    st.warning("That exact edited match/result already exists. Changes were not saved.")
+                elif match_exists(division, e_week, e_date, e_home, e_away, e_hg, e_ag, exclude_id=int(sel["id"])):
+                    st.warning("That exact result already exists. No changes saved.")
                 else:
-                    update_match(int(selected_row["id"]), division, edit_week, edit_date, edit_home, edit_away, edit_hg, edit_ag, edit_notes)
-                    st.success("Match updated.")
+                    update_match(int(sel["id"]), division, e_week, e_date, e_home, e_away, e_hg, e_ag, e_notes)
+                    st.success("Result updated.")
                     st.rerun()
 
-            if delete_selected:
-                delete_match(int(selected_row["id"]))
-                st.success("Match deleted.")
+            if do_delete:
+                delete_match(int(sel["id"]))
+                st.success("Result deleted.")
                 st.rerun()
-
 
 def page_teams(division: str, teams: list[str]):
     st.markdown('<div class="section-header">👥 Team Management</div>', unsafe_allow_html=True)
+    if not require_admin("add or edit teams"):
+        st.markdown("#### Current Teams")
+        st.dataframe(pd.DataFrame({"Team": sorted(teams)}), width="stretch", hide_index=True)
+        return
 
     add_tab, edit_tab, delete_tab = st.tabs(["Add Team", "Edit Team Name", "Delete Team"])
 
@@ -1776,18 +2158,21 @@ def page_dashboard(df, division: str, teams: list[str]):
 def page_notes(division: str):
     st.markdown('<div class="section-header">📣 League Notes & Announcements</div>', unsafe_allow_html=True)
 
-    with st.form(f"note_form_{division}", clear_on_submit=True):
-        note_text = st.text_area(
-            "Add a new note or announcement",
-            height=120,
-            placeholder="e.g. Next games moved to Saturday due to field maintenance..."
-        )
-        submitted = st.form_submit_button("📌 Post Note", width="stretch")
+    if is_admin():
+        with st.form(f"note_form_{division}", clear_on_submit=True):
+            note_text = st.text_area(
+                "Add a new note or announcement",
+                height=120,
+                placeholder="e.g. Next games moved to Saturday due to field maintenance..."
+            )
+            submitted = st.form_submit_button("📌 Post Note", width="stretch")
 
-    if submitted and note_text.strip():
-        insert_note(division, note_text.strip())
-        st.success("Note posted.")
-        st.rerun()
+        if submitted and note_text.strip():
+            insert_note(division, note_text.strip())
+            st.success("Note posted.")
+            st.rerun()
+    else:
+        st.info("🔒 Unlock admin to post or delete notes.")
 
     notes_df = load_notes(division)
     if notes_df.empty:
@@ -1797,7 +2182,7 @@ def page_notes(division: str):
             created_fmt = format_display_date(str(row["created"]).split(" ")[0]) + " " + str(row["created"]).split(" ")[1] if " " in str(row["created"]) else row["created"]
             with st.expander(f"📌 {created_fmt}", expanded=True):
                 st.write(row["note_text"])
-                if st.button("🗑️ Delete", key=f"del_note_{row['id']}"):
+                if is_admin() and st.button("🗑️ Delete", key=f"del_note_{row['id']}"):
                     delete_note(row["id"])
                     st.rerun()
 
@@ -1828,7 +2213,14 @@ def page_export(df, division: str, teams: list[str]):
     png_bytes = make_power_rankings_png(pr, movement, division)
     dashboard_pdf = make_dashboard_pdf(division, df, teams)
 
-    col1, col2, col3, col4, col5 = st.columns(5)
+    # Schedule export
+    sched_export = load_schedule_from_db(division).copy()
+    if not sched_export.empty:
+        sched_export["game_date"] = sched_export["game_date"].apply(format_display_date)
+        sched_export = sched_export[["week", "game_date", "time", "home_team", "away_team", "location", "status", "notes"]]
+        sched_export.columns = ["Week", "Date", "Time", "Home", "Away", "Location", "Status", "Notes"]
+
+    col1, col2, col3, col4, col5, col6 = st.columns(6)
 
     with col1:
         st.download_button(
@@ -1875,11 +2267,24 @@ def page_export(df, division: str, teams: list[str]):
             width="stretch",
         )
 
+    with col6:
+        if not sched_export.empty:
+            st.download_button(
+                "🗓️ Schedule CSV",
+                data=df_to_csv_bytes(sched_export),
+                file_name=f"{division.lower().replace(' ', '_')}_schedule_{datetime.now().strftime('%m%d%Y')}.csv",
+                mime="text/csv",
+                width="stretch",
+            )
+
 # ─────────────────────────────────────────────
 # MAIN
 # ─────────────────────────────────────────────
 def main():
-    init_db()
+    # Run DB init once per session to avoid ScriptRunContext warnings on reload
+    if "db_initialized" not in st.session_state:
+        init_db()
+        st.session_state["db_initialized"] = True
     inject_css()
 
     st.sidebar.title("Pensacola FC")
@@ -1913,7 +2318,7 @@ def main():
         "Navigate",
         [
             "📊 Dashboard",
-            "📝 Score Entry",
+            "📋 Game Manager",
             "👥 Teams",
             "📋 Match History",
             "🏆 Standings",
@@ -1939,10 +2344,12 @@ def main():
     st.sidebar.divider()
     st.sidebar.caption("Built for youth soccer league admins.")
 
+    render_admin_sidebar()
+
     if page == "📊 Dashboard":
         page_dashboard(df, selected_division, teams)
-    elif page == "📝 Score Entry":
-        page_score_entry(df, selected_division, teams)
+    elif page == "📋 Game Manager":
+        page_game_manager(df, selected_division, teams)
     elif page == "👥 Teams":
         page_teams(selected_division, teams)
     elif page == "📋 Match History":
