@@ -334,11 +334,25 @@ def init_db():
             )
     conn.commit()
 
-    # ── One-time migration: delete any hardcoded demo results that were
-    #    auto-seeded from DEFAULT_RESULTS (game_date = '2025-01-01').
-    #    Real results entered via Game Manager will never have that date.
-    c.execute("DELETE FROM matches WHERE game_date = '2025-01-01'")
+    # ── Migration: ensure no seeded/demo match rows exist.
+    #    We track this with a flag in a simple meta table so it only
+    #    runs once even across server restarts.
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS meta (
+            key   TEXT PRIMARY KEY,
+            value TEXT
+        )
+    """)
     conn.commit()
+
+    already_purged = c.execute(
+        "SELECT value FROM meta WHERE key='demo_purged'"
+    ).fetchone()
+
+    if not already_purged:
+        c.execute("DELETE FROM matches")
+        c.execute("INSERT OR REPLACE INTO meta (key, value) VALUES ('demo_purged', '1')")
+        conn.commit()
 
     # Seed schedule table from SCHEDULE_ROWS if empty
     for division, rows in SCHEDULE_ROWS.items():
@@ -2259,10 +2273,7 @@ def page_export(df, division: str, teams: list[str]):
 # MAIN
 # ─────────────────────────────────────────────
 def main():
-    # Run DB init once per session to avoid ScriptRunContext warnings on reload
-    if "db_initialized" not in st.session_state:
-        init_db()
-        st.session_state["db_initialized"] = True
+    init_db()
     inject_css()
 
     st.sidebar.title("Pensacola FC")
