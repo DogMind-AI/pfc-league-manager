@@ -83,18 +83,6 @@ TEAM_NAME_ALIASES = {
 def normalize_team_name(name):
     return TEAM_NAME_ALIASES.get(name, name)
 
-DEFAULT_RESULTS = {
-    "U15 Boys": [
-        ("U15 Boys", 1, "2025-01-01", "Cobras", "Athletico", 3, 2, "Week 1 opener"),
-        ("U15 Boys", 1, "2025-01-01", "Vipers", "PSY T1", 4, 0, ""),
-        ("U15 Boys", 1, "2025-01-01", "Beavers", "PSYT2", 3, 3, ""),
-        ("U15 Boys", 1, "2025-01-01", "Los Locos", "Pelicans", 7, 2, ""),
-    ],
-    "U15 Girls": [
-        ("U15 Girls", 1, "2025-01-01", "Tator Tots", "PSY City", 2, 0, ""),
-        ("U15 Girls", 1, "2025-01-01", "Shockwaves", "Team Seth", 5, 1, ""),
-    ],
-}
 
 SCHEDULE_ROWS = {
     "U15 Boys": [
@@ -346,21 +334,11 @@ def init_db():
             )
     conn.commit()
 
-    for division, rows in DEFAULT_RESULTS.items():
-        count = c.execute(
-            "SELECT COUNT(*) FROM matches WHERE division=?",
-            (division,),
-        ).fetchone()[0]
-        if count == 0:
-            c.executemany(
-                """
-                INSERT INTO matches
-                (division, week, game_date, home_team, away_team, home_goals, away_goals, notes)
-                VALUES (?,?,?,?,?,?,?,?)
-                """,
-                rows,
-            )
-            conn.commit()
+    # ── One-time migration: delete any hardcoded demo results that were
+    #    auto-seeded from DEFAULT_RESULTS (game_date = '2025-01-01').
+    #    Real results entered via Game Manager will never have that date.
+    c.execute("DELETE FROM matches WHERE game_date = '2025-01-01'")
+    conn.commit()
 
     # Seed schedule table from SCHEDULE_ROWS if empty
     for division, rows in SCHEDULE_ROWS.items():
