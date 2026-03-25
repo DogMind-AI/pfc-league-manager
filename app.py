@@ -16,6 +16,7 @@ Multi-division youth soccer league dashboard with:
 - schedule manager (add games, reschedule, mark canceled/bye/played)
 - password-protected admin editing
 - PDF / PNG / CSV exports
+- partial-count games (counts for both, home only, away only, or neither)
 """
 
 import streamlit as st
@@ -48,7 +49,10 @@ st.set_page_config(
 
 DB_PATH = "league.db"
 DIVISIONS = ["U15 Boys", "U15 Girls"]
-ADMIN_PASSWORD = "cobras2026"   # ← change this to whatever you want
+ADMIN_PASSWORD = "cobras2026"
+
+# counts_for options
+COUNTS_OPTIONS = ["Both Teams", "Home Only", "Away Only", "Neither"]
 
 DEFAULT_TEAMS = {
     "U15 Boys": [
@@ -161,6 +165,8 @@ PFC_GOLD = "#D4AF37"
 PFC_AMBER = "#D99100"
 PFC_DARK = "#0F1B3D"
 PFC_ORANGE = "#E67E22"
+PFC_PURPLE = "#7B52AB"
+
 
 # ─────────────────────────────────────────────
 # DATE / LOGO HELPERS
@@ -278,7 +284,8 @@ def init_db():
             away_team  TEXT NOT NULL,
             home_goals INTEGER NOT NULL,
             away_goals INTEGER NOT NULL,
-            notes      TEXT DEFAULT ''
+            notes      TEXT DEFAULT '',
+            counts_for TEXT DEFAULT 'Both Teams'
         )
     """)
 
@@ -300,7 +307,6 @@ def init_db():
         )
     """)
 
-    # ── NEW: schedule table ──────────────────────────────────────────────
     c.execute("""
         CREATE TABLE IF NOT EXISTS schedule (
             id         INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -315,15 +321,21 @@ def init_db():
             notes      TEXT DEFAULT ''
         )
     """)
-    # status values: 'scheduled' | 'canceled' | 'bye'
+
     conn.commit()
 
+    # Migrations for existing databases
     if not column_exists(conn, "matches", "division"):
         c.execute("ALTER TABLE matches ADD COLUMN division TEXT DEFAULT 'U15 Boys'")
         conn.commit()
 
     if not column_exists(conn, "league_notes", "division"):
         c.execute("ALTER TABLE league_notes ADD COLUMN division TEXT DEFAULT 'U15 Boys'")
+        conn.commit()
+
+    # NEW: add counts_for column if missing (migration for existing DBs)
+    if not column_exists(conn, "matches", "counts_for"):
+        c.execute("ALTER TABLE matches ADD COLUMN counts_for TEXT DEFAULT 'Both Teams'")
         conn.commit()
 
     for division, teams in DEFAULT_TEAMS.items():
@@ -334,9 +346,6 @@ def init_db():
             )
     conn.commit()
 
-    # ── Migration: ensure no seeded/demo match rows exist.
-    #    We track this with a flag in a simple meta table so it only
-    #    runs once even across server restarts.
     c.execute("""
         CREATE TABLE IF NOT EXISTS meta (
             key   TEXT PRIMARY KEY,
@@ -405,28 +414,11 @@ def add_team(division: str, team_name: str):
 def rename_team(division: str, old_name: str, new_name: str):
     conn = get_conn()
     new_name = new_name.strip()
-
-    conn.execute(
-        "UPDATE teams SET team_name=? WHERE division=? AND team_name=?",
-        (new_name, division, old_name),
-    )
-    conn.execute(
-        "UPDATE matches SET home_team=? WHERE division=? AND home_team=?",
-        (new_name, division, old_name),
-    )
-    conn.execute(
-        "UPDATE matches SET away_team=? WHERE division=? AND away_team=?",
-        (new_name, division, old_name),
-    )
-    # Also update schedule table
-    conn.execute(
-        "UPDATE schedule SET home_team=? WHERE division=? AND home_team=?",
-        (new_name, division, old_name),
-    )
-    conn.execute(
-        "UPDATE schedule SET away_team=? WHERE division=? AND away_team=?",
-        (new_name, division, old_name),
-    )
+    conn.execute("UPDATE teams SET team_name=? WHERE division=? AND team_name=?", (new_name, division, old_name))
+    conn.execute("UPDATE matches SET home_team=? WHERE division=? AND home_team=?", (new_name, division, old_name))
+    conn.execute("UPDATE matches SET away_team=? WHERE division=? AND away_team=?", (new_name, division, old_name))
+    conn.execute("UPDATE schedule SET home_team=? WHERE division=? AND home_team=?", (new_name, division, old_name))
+    conn.execute("UPDATE schedule SET away_team=? WHERE division=? AND away_team=?", (new_name, division, old_name))
     conn.commit()
     conn.close()
 
@@ -434,10 +426,7 @@ def rename_team(division: str, old_name: str, new_name: str):
 def can_delete_team(division: str, team_name: str) -> bool:
     conn = get_conn()
     count = conn.execute(
-        """
-        SELECT COUNT(*) FROM matches
-        WHERE division=? AND (home_team=? OR away_team=?)
-        """,
+        "SELECT COUNT(*) FROM matches WHERE division=? AND (home_team=? OR away_team=?)",
         (division, team_name, team_name),
     ).fetchone()[0]
     conn.close()
@@ -446,10 +435,7 @@ def can_delete_team(division: str, team_name: str) -> bool:
 
 def delete_team(division: str, team_name: str):
     conn = get_conn()
-    conn.execute(
-        "DELETE FROM teams WHERE division=? AND team_name=?",
-        (division, team_name),
-    )
+    conn.execute("DELETE FROM teams WHERE division=? AND team_name=?", (division, team_name))
     conn.commit()
     conn.close()
 
@@ -464,11 +450,11 @@ def load_matches(division: str) -> pd.DataFrame:
     conn.close()
     if not df.empty:
         df["game_date"] = df["game_date"].astype(str)
-
-    if not df.empty:
         df["home_team"] = df["home_team"].apply(normalize_team_name)
         df["away_team"] = df["away_team"].apply(normalize_team_name)
-
+        if "counts_for" not in df.columns:
+            df["counts_for"] = "Both Teams"
+        df["counts_for"] = df["counts_for"].fillna("Both Teams")
     return df
 
 
@@ -487,28 +473,28 @@ def match_exists(division, week, game_date, home, away, hg, ag, exclude_id=None)
     return count > 0
 
 
-def insert_match(division, week, game_date, home, away, hg, ag, notes):
+def insert_match(division, week, game_date, home, away, hg, ag, notes, counts_for="Both Teams"):
     conn = get_conn()
     conn.execute(
         """
-        INSERT INTO matches (division, week, game_date, home_team, away_team, home_goals, away_goals, notes)
-        VALUES (?,?,?,?,?,?,?,?)
+        INSERT INTO matches (division, week, game_date, home_team, away_team, home_goals, away_goals, notes, counts_for)
+        VALUES (?,?,?,?,?,?,?,?,?)
         """,
-        (division, int(week), to_iso_date(game_date), home, away, int(hg), int(ag), notes.strip()),
+        (division, int(week), to_iso_date(game_date), home, away, int(hg), int(ag), notes.strip(), counts_for),
     )
     conn.commit()
     conn.close()
 
 
-def update_match(match_id, division, week, game_date, home, away, hg, ag, notes):
+def update_match(match_id, division, week, game_date, home, away, hg, ag, notes, counts_for="Both Teams"):
     conn = get_conn()
     conn.execute(
         """
         UPDATE matches
-        SET division=?, week=?, game_date=?, home_team=?, away_team=?, home_goals=?, away_goals=?, notes=?
+        SET division=?, week=?, game_date=?, home_team=?, away_team=?, home_goals=?, away_goals=?, notes=?, counts_for=?
         WHERE id=?
         """,
-        (division, int(week), to_iso_date(game_date), home, away, int(hg), int(ag), notes.strip(), int(match_id)),
+        (division, int(week), to_iso_date(game_date), home, away, int(hg), int(ag), notes.strip(), counts_for, int(match_id)),
     )
     conn.commit()
     conn.close()
@@ -553,7 +539,6 @@ def delete_note(note_id):
 # SCHEDULE DB FUNCTIONS
 # ─────────────────────────────────────────────
 def load_schedule_from_db(division: str) -> pd.DataFrame:
-    """Load full schedule from DB (all statuses)."""
     conn = get_conn()
     df = pd.read_sql_query(
         "SELECT * FROM schedule WHERE division=? ORDER BY week, game_date, time, home_team",
@@ -567,7 +552,6 @@ def load_schedule_from_db(division: str) -> pd.DataFrame:
 
 
 def load_schedule_df(division: str) -> pd.DataFrame:
-    """Load only 'scheduled' games for predictions — excludes canceled, bye, and played."""
     df = load_schedule_from_db(division)
     if df.empty:
         return pd.DataFrame(columns=["week", "game_date", "home_team", "away_team", "location", "time"])
@@ -610,7 +594,6 @@ def delete_schedule_game(game_id):
 
 
 def set_game_status(game_id: int, status: str, notes: str = ""):
-    """Quickly flip a game's status (scheduled/canceled/bye)."""
     conn = get_conn()
     conn.execute(
         "UPDATE schedule SET status=?, notes=? WHERE id=?",
@@ -621,8 +604,25 @@ def set_game_status(game_id: int, status: str, notes: str = ""):
 
 
 # ─────────────────────────────────────────────
-# ANALYTICS
+# ANALYTICS — counts_for aware
 # ─────────────────────────────────────────────
+
+def counts_for_team(counts_for: str, side: str) -> bool:
+    """
+    Returns True if this match row should count for the given side.
+    side: 'home' or 'away'
+    """
+    if counts_for == "Both Teams":
+        return True
+    if counts_for == "Home Only":
+        return side == "home"
+    if counts_for == "Away Only":
+        return side == "away"
+    if counts_for == "Neither":
+        return False
+    return True  # default safe fallback
+
+
 def normalize_series(s: pd.Series) -> pd.Series:
     if s.empty:
         return s
@@ -650,32 +650,50 @@ def compute_standings(df: pd.DataFrame, teams: list[str]) -> pd.DataFrame:
     for _, row in df.iterrows():
         h, a = row["home_team"], row["away_team"]
         hg, ag = int(row["home_goals"]), int(row["away_goals"])
+        cf = row.get("counts_for", "Both Teams") or "Both Teams"
+
+        home_counts = counts_for_team(cf, "home")
+        away_counts = counts_for_team(cf, "away")
 
         raw_gd = hg - ag
         capped = int(np.clip(raw_gd, -4, 4))
 
-        records[h]["GP"] += 1
-        records[a]["GP"] += 1
-        records[h]["GF"] += hg
-        records[h]["GA"] += ag
-        records[a]["GF"] += ag
-        records[a]["GA"] += hg
-        records[h]["GD_capped"] += capped
-        records[a]["GD_capped"] -= capped
-
+        # Determine match outcome
         if hg > ag:
-            records[h]["W"] += 1
-            records[h]["Pts"] += 3
-            records[a]["L"] += 1
+            home_result, away_result = "W", "L"
         elif hg < ag:
-            records[a]["W"] += 1
-            records[a]["Pts"] += 3
-            records[h]["L"] += 1
+            home_result, away_result = "L", "W"
         else:
-            records[h]["D"] += 1
-            records[a]["D"] += 1
-            records[h]["Pts"] += 1
-            records[a]["Pts"] += 1
+            home_result, away_result = "D", "D"
+
+        # Apply stats only if it counts for that team
+        if home_counts:
+            records[h]["GP"] += 1
+            records[h]["GF"] += hg
+            records[h]["GA"] += ag
+            records[h]["GD_capped"] += capped
+            if home_result == "W":
+                records[h]["W"] += 1
+                records[h]["Pts"] += 3
+            elif home_result == "D":
+                records[h]["D"] += 1
+                records[h]["Pts"] += 1
+            else:
+                records[h]["L"] += 1
+
+        if away_counts:
+            records[a]["GP"] += 1
+            records[a]["GF"] += ag
+            records[a]["GA"] += hg
+            records[a]["GD_capped"] -= capped
+            if away_result == "W":
+                records[a]["W"] += 1
+                records[a]["Pts"] += 3
+            elif away_result == "D":
+                records[a]["D"] += 1
+                records[a]["Pts"] += 1
+            else:
+                records[a]["L"] += 1
 
     rows = []
     for team, stats in records.items():
@@ -734,6 +752,10 @@ def compute_power_package(df: pd.DataFrame, teams: list[str]):
         h, a = row["home_team"], row["away_team"]
         hg, ag = int(row["home_goals"]), int(row["away_goals"])
         match_date = row["game_date"]
+        cf = row.get("counts_for", "Both Teams") or "Both Teams"
+
+        home_counts = counts_for_team(cf, "home")
+        away_counts = counts_for_team(cf, "away")
 
         pre_h = elo[h]
         pre_a = elo[a]
@@ -760,24 +782,10 @@ def compute_power_package(df: pd.DataFrame, teams: list[str]):
             res_h, res_a = "D", "D"
             underdog_win = abs(exp_h - 0.5) > 0.15
 
-        form_points[h].append(pts_h)
-        form_points[a].append(pts_a)
-        match_points[h].append(pts_h)
-        match_points[a].append(pts_a)
-        raw_gd[h].append(hg - ag)
-        raw_gd[a].append(ag - hg)
-        results_text[h].append(res_h)
-        results_text[a].append(res_a)
-
+        # Elo always updates regardless of counts_for (reflects actual game played)
         goal_diff = abs(hg - ag)
         recency_w = 1.0 + 0.08 * (idx / max(n_matches - 1, 1))
         mov_mult = 1.0 + 0.10 * min(goal_diff, 8)
-
-        expected_winner = h if exp_h > exp_a else a if exp_a > exp_h else "Even"
-        expected_winner_prob = max(exp_h, exp_a)
-        actual_result_prob = exp_h if hg > ag else exp_a if hg < ag else (1 - abs(exp_h - 0.5))
-        upset_probability = round((1 - actual_result_prob) * 100, 1)
-
         upset_score = abs(act_h - exp_h)
         k = 32 * recency_w * mov_mult * (1 + upset_score)
         delta_h = k * (act_h - exp_h)
@@ -785,8 +793,27 @@ def compute_power_package(df: pd.DataFrame, teams: list[str]):
         elo[h] += delta_h
         elo[a] += delta_a
 
-        opp_pre_elo[h].append(pre_a)
-        opp_pre_elo[a].append(pre_h)
+        # Form/stats only for teams where it counts
+        if home_counts:
+            form_points[h].append(pts_h)
+            match_points[h].append(pts_h)
+            raw_gd[h].append(hg - ag)
+            results_text[h].append(res_h)
+            opp_pre_elo[h].append(pre_a)
+
+        if away_counts:
+            form_points[a].append(pts_a)
+            match_points[a].append(pts_a)
+            raw_gd[a].append(ag - hg)
+            results_text[a].append(res_a)
+            opp_pre_elo[a].append(pre_h)
+
+        expected_winner = h if exp_h > exp_a else a if exp_a > exp_h else "Even"
+        expected_winner_prob = max(exp_h, exp_a)
+        actual_result_prob = exp_h if hg > ag else exp_a if hg < ag else (1 - abs(exp_h - 0.5))
+        upset_probability = round((1 - actual_result_prob) * 100, 1)
+
+        counts_label = cf if cf != "Both Teams" else ""
 
         match_logs.append({
             "Week": int(row["week"]),
@@ -797,6 +824,7 @@ def compute_power_package(df: pd.DataFrame, teams: list[str]):
             "AG": ag,
             "Score": f"{hg}-{ag}",
             "Winner": winner,
+            "Counts For": cf,
             "Expected Winner": expected_winner,
             "Expected Winner Prob": round(expected_winner_prob * 100, 1),
             "Actual Result Prob": round(actual_result_prob * 100, 1),
@@ -956,17 +984,12 @@ def compute_current_metrics(df: pd.DataFrame, teams: list[str]):
 
 
 def compute_upcoming_predictions(df: pd.DataFrame, division: str, teams: list[str]) -> pd.DataFrame:
-    # Uses load_schedule_df which now reads from DB and filters to 'scheduled' only
     schedule_df = load_schedule_df(division)
     if schedule_df.empty:
         return schedule_df
 
     completed = set(
-        zip(
-            df["game_date"].astype(str),
-            df["home_team"].astype(str),
-            df["away_team"].astype(str),
-        )
+        zip(df["game_date"].astype(str), df["home_team"].astype(str), df["away_team"].astype(str))
     )
     upcoming = schedule_df[
         ~schedule_df.apply(lambda r: (str(r["game_date"]), str(r["home_team"]), str(r["away_team"])) in completed, axis=1)
@@ -984,13 +1007,10 @@ def compute_upcoming_predictions(df: pd.DataFrame, division: str, teams: list[st
 
         home_elo = pr_map.get(home, {}).get("Elo Rating", 1500.0)
         away_elo = pr_map.get(away, {}).get("Elo Rating", 1500.0)
-
         home_form = analytics_map.get(home, {}).get("Form Index", 1.5)
         away_form = analytics_map.get(away, {}).get("Form Index", 1.5)
-
         home_gdm = analytics_map.get(home, {}).get("GD Momentum", 0.0)
         away_gdm = analytics_map.get(away, {}).get("GD Momentum", 0.0)
-
         home_sos = analytics_map.get(home, {}).get("Strength of Schedule", 1500.0)
         away_sos = analytics_map.get(away, {}).get("Strength of Schedule", 1500.0)
 
@@ -1016,12 +1036,7 @@ def compute_upcoming_predictions(df: pd.DataFrame, division: str, teams: list[st
         else:
             upset_alert = "✅ Low"
 
-        if home_form > away_form:
-            form_edge = home
-        elif away_form > home_form:
-            form_edge = away
-        else:
-            form_edge = "Even"
+        form_edge = home if home_form > away_form else away if away_form > home_form else "Even"
 
         records.append({
             "Week": int(row["week"]),
@@ -1039,6 +1054,7 @@ def compute_upcoming_predictions(df: pd.DataFrame, division: str, teams: list[st
         })
 
     return pd.DataFrame(records).sort_values(["Date", "Time", "Match"]).reset_index(drop=True)
+
 
 # ─────────────────────────────────────────────
 # DISPLAY HELPERS
@@ -1088,6 +1104,19 @@ def status_badge(status: str) -> str:
     return f'<span style="background:{PFC_GREEN};color:white;padding:2px 8px;border-radius:6px;font-size:11px;font-weight:700;">SCHEDULED</span>'
 
 
+def counts_for_badge(counts_for: str) -> str:
+    """Visual badge showing which teams the result counts for."""
+    if counts_for == "Both Teams" or not counts_for:
+        return ""  # No badge needed — normal game
+    if counts_for == "Home Only":
+        return f'<span style="background:{PFC_PURPLE};color:white;padding:2px 8px;border-radius:6px;font-size:11px;font-weight:700;margin-left:6px;">HOME ONLY</span>'
+    if counts_for == "Away Only":
+        return f'<span style="background:{PFC_BLUE};color:white;padding:2px 8px;border-radius:6px;font-size:11px;font-weight:700;margin-left:6px;">AWAY ONLY</span>'
+    if counts_for == "Neither":
+        return f'<span style="background:{PFC_DARK};color:white;padding:2px 8px;border-radius:6px;font-size:11px;font-weight:700;margin-left:6px;">FRIENDLY</span>'
+    return ""
+
+
 # ─────────────────────────────────────────────
 # EXPORT HELPERS
 # ─────────────────────────────────────────────
@@ -1129,13 +1158,10 @@ def make_power_rankings_png(pr: pd.DataFrame, movement: dict, division: str) -> 
     for i, row in pr_reset.iterrows():
         bar_color = team_bar_colors[i % len(team_bar_colors)]
         draw.rounded_rectangle([35, y, width - 35, y + 82], radius=18, fill=bar_color)
-
         draw.text((70, y + 15), f"{int(row['Power Rank'])}.", fill=PFC_WHITE, font=font_rank)
         draw.text((180, y + 14), str(row["Team"]).upper(), fill=PFC_WHITE, font=font_team)
-
         move = movement.get(row["Team"], 0)
         draw.text((width - 290, y + 16), movement_arrow(move), fill=movement_color(move), font=font_team)
-
         meta = (
             f"Power {row['Power Score']}   |   Elo {row['Elo Rating']}   |   "
             f"Form {row['Form']}   |   GDM {row['GD Momentum']}"
@@ -1156,28 +1182,17 @@ def make_power_rankings_png(pr: pd.DataFrame, movement: dict, division: str) -> 
     return output.getvalue()
 
 
-def make_league_summary_pdf(
-    division: str,
-    standings: pd.DataFrame,
-    pr: pd.DataFrame,
-    recent_results: pd.DataFrame,
-    analytics_df: pd.DataFrame
-) -> bytes:
+def make_league_summary_pdf(division, standings, pr, recent_results, analytics_df) -> bytes:
     buffer = io.BytesIO()
-    doc = SimpleDocTemplate(
-        buffer,
-        pagesize=landscape(letter),
-        leftMargin=30,
-        rightMargin=30,
-        topMargin=25,
-        bottomMargin=25,
-    )
+    doc = SimpleDocTemplate(buffer, pagesize=landscape(letter), leftMargin=30, rightMargin=30, topMargin=25, bottomMargin=25)
     styles = getSampleStyleSheet()
     story = []
 
-    title = Paragraph(f"<b>Pensacola FC League Summary - {division}</b>", styles["Title"])
-    subtitle = Paragraph(f"Generated on {datetime.now().strftime('%m/%d/%Y %I:%M %p')}", styles["Normal"])
-    story.extend([title, subtitle, Spacer(1, 12)])
+    story.extend([
+        Paragraph(f"<b>Pensacola FC League Summary - {division}</b>", styles["Title"]),
+        Paragraph(f"Generated on {datetime.now().strftime('%m/%d/%Y %I:%M %p')}", styles["Normal"]),
+        Spacer(1, 12),
+    ])
 
     def make_table(df_table, title_text):
         story.append(Paragraph(f"<b>{title_text}</b>", styles["Heading2"]))
@@ -1188,7 +1203,6 @@ def make_league_summary_pdf(
             ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
             ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
             ("GRID", (0, 0), (-1, -1), 0.35, colors.grey),
-            ("BACKGROUND", (0, 1), (-1, -1), colors.HexColor("#F7F9FE")),
             ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.HexColor("#F7F9FE"), colors.HexColor("#EEF3FD")]),
             ("FONTSIZE", (0, 0), (-1, -1), 8.5),
             ("PADDING", (0, 0), (-1, -1), 5),
@@ -1196,27 +1210,11 @@ def make_league_summary_pdf(
         story.append(tbl)
         story.append(Spacer(1, 14))
 
-    standings_pdf = standings.reset_index()[["Rank", "Team", "GP", "W", "D", "L", "GF", "GA", "GD", "Pts"]]
-    pr_pdf = pr.reset_index()[["Power Rank", "Team", "Power Score", "Elo Rating", "Form", "Form Index", "GD Momentum"]]
-    analytics_pdf = analytics_df[["Team", "Strength of Schedule", "Form Index", "GD Momentum", "Trend", "Projected Rank", "Tier"]].copy()
-
-    recent_pdf = (
-        recent_results[["Week", "Date", "Home", "Score", "Away", "Notes"]].copy()
-        if not recent_results.empty
-        else pd.DataFrame(columns=["Week", "Date", "Home", "Score", "Away", "Notes"])
-    )
-
-    make_table(standings_pdf, "Official Standings")
-    make_table(pr_pdf, "Power Rankings")
-    make_table(analytics_pdf, "Advanced Analytics Snapshot")
-    if not recent_pdf.empty:
-        make_table(recent_pdf.head(8), "Recent Results")
-
-    expl = Paragraph(
-        "Power rankings are separate from official standings. They blend Elo rating, weighted form index, strength of schedule, goal differential momentum, upset impact, and scoring margin to estimate current team strength and short-term trajectory.",
-        styles["Normal"]
-    )
-    story.append(expl)
+    make_table(standings.reset_index()[["Rank", "Team", "GP", "W", "D", "L", "GF", "GA", "GD", "Pts"]], "Official Standings")
+    make_table(pr.reset_index()[["Power Rank", "Team", "Power Score", "Elo Rating", "Form", "Form Index", "GD Momentum"]], "Power Rankings")
+    make_table(analytics_df[["Team", "Strength of Schedule", "Form Index", "GD Momentum", "Trend", "Projected Rank", "Tier"]], "Advanced Analytics")
+    if not recent_results.empty:
+        make_table(recent_results.head(8), "Recent Results")
 
     doc.build(story)
     pdf = buffer.getvalue()
@@ -1230,31 +1228,19 @@ def make_dashboard_pdf(division: str, df: pd.DataFrame, teams: list[str]) -> byt
     upcoming = compute_upcoming_predictions(df, division, teams)
 
     buffer = io.BytesIO()
-    doc = SimpleDocTemplate(
-        buffer,
-        pagesize=landscape(letter),
-        leftMargin=25,
-        rightMargin=25,
-        topMargin=20,
-        bottomMargin=20,
-    )
+    doc = SimpleDocTemplate(buffer, pagesize=landscape(letter), leftMargin=25, rightMargin=25, topMargin=20, bottomMargin=20)
     styles = getSampleStyleSheet()
     story = []
 
-    title = Paragraph(f"<b>Pensacola FC Dashboard Export - {division}</b>", styles["Title"])
-    subtitle = Paragraph(f"Generated on {datetime.now().strftime('%m/%d/%Y %I:%M %p')}", styles["Normal"])
-    story.extend([title, subtitle, Spacer(1, 12)])
+    story.extend([
+        Paragraph(f"<b>Pensacola FC Dashboard Export - {division}</b>", styles["Title"]),
+        Paragraph(f"Generated on {datetime.now().strftime('%m/%d/%Y %I:%M %p')}", styles["Normal"]),
+        Spacer(1, 12),
+    ])
 
     total_goals = int(df["home_goals"].sum() + df["away_goals"].sum()) if not df.empty else 0
     avg_goals = round(total_goals / max(len(df), 1), 1) if not df.empty else 0
     current_week = int(df["week"].max()) if not df.empty else 0
-
-    summary_df = pd.DataFrame([{
-        "Matches Played": len(df),
-        "Current Week": current_week,
-        "Total Goals": total_goals,
-        "Avg Goals / Match": avg_goals
-    }])
 
     def make_table(df_table, title_text):
         story.append(Paragraph(f"<b>{title_text}</b>", styles["Heading2"]))
@@ -1265,7 +1251,6 @@ def make_dashboard_pdf(division: str, df: pd.DataFrame, teams: list[str]) -> byt
             ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
             ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
             ("GRID", (0, 0), (-1, -1), 0.35, colors.grey),
-            ("BACKGROUND", (0, 1), (-1, -1), colors.HexColor("#F7F9FE")),
             ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.HexColor("#F7F9FE"), colors.HexColor("#EEF3FD")]),
             ("FONTSIZE", (0, 0), (-1, -1), 8.5),
             ("PADDING", (0, 0), (-1, -1), 5),
@@ -1273,21 +1258,18 @@ def make_dashboard_pdf(division: str, df: pd.DataFrame, teams: list[str]) -> byt
         story.append(tbl)
         story.append(Spacer(1, 12))
 
-    make_table(summary_df, "Dashboard Summary")
+    make_table(pd.DataFrame([{"Matches Played": len(df), "Week": current_week, "Total Goals": total_goals, "Avg Goals/Match": avg_goals}]), "Summary")
     make_table(standings.reset_index()[["Rank", "Team", "GP", "W", "D", "L", "GD", "Pts"]], "Official Standings")
     make_table(pr.reset_index()[["Power Rank", "Team", "Power Score", "Elo Rating", "Form", "GD Momentum"]], "Power Rankings")
     make_table(analytics_df[["Team", "Strength of Schedule", "Form Index", "GD Momentum", "Trend", "Projected Rank", "Tier"]], "Advanced Analytics")
-
     if not upcoming.empty:
-        make_table(
-            upcoming[["Week", "Date", "Time", "Match", "Favorite", "Favorite Win %", "Upset Alert", "Form Edge"]],
-            "Next Week Upcoming Match Predictions"
-        )
+        make_table(upcoming[["Week", "Date", "Time", "Match", "Favorite", "Favorite Win %", "Upset Alert", "Form Edge"]], "Upcoming Predictions")
 
     doc.build(story)
     pdf = buffer.getvalue()
     buffer.close()
     return pdf
+
 
 # ─────────────────────────────────────────────
 # CSS
@@ -1436,10 +1418,22 @@ def inject_css():
             padding: 10px 14px;
             margin: 6px 0;
         }}
+
+        .counts-banner {{
+            background: #F3EEFF;
+            border: 1px solid #C9B8F0;
+            border-radius: 8px;
+            padding: 10px 14px;
+            margin-top: 10px;
+            font-size: 0.9rem;
+            color: {PFC_PURPLE};
+            font-weight: 600;
+        }}
         </style>
         """,
         unsafe_allow_html=True,
     )
+
 
 # ─────────────────────────────────────────────
 # ADMIN AUTH
@@ -1449,7 +1443,6 @@ def is_admin() -> bool:
 
 
 def render_admin_sidebar():
-    """Renders the lock/unlock widget in the sidebar."""
     st.sidebar.divider()
     if is_admin():
         st.sidebar.markdown(
@@ -1479,7 +1472,6 @@ def render_admin_sidebar():
 
 
 def require_admin(label: str = "this action"):
-    """Call at the top of any edit page/section. Shows a warning and returns False if not admin."""
     if not is_admin():
         st.warning(f"🔒 Admin access required to {label}. Use the sidebar to unlock.")
         return False
@@ -1487,15 +1479,60 @@ def require_admin(label: str = "this action"):
 
 
 # ─────────────────────────────────────────────
+# COUNTS-FOR HELPER UI
+# ─────────────────────────────────────────────
+def counts_for_selector(key: str, default: str = "Both Teams", home_team: str = "", away_team: str = "") -> str:
+    """
+    Renders the 'Counts For' radio selector with a contextual explanation.
+    Returns the selected value.
+    """
+    cf = st.radio(
+        "Result counts for",
+        COUNTS_OPTIONS,
+        index=COUNTS_OPTIONS.index(default) if default in COUNTS_OPTIONS else 0,
+        horizontal=True,
+        key=key,
+        help=(
+            "Both Teams = normal game, result counts for standings of both teams.\n"
+            "Home Only = only the home team gets standings credit.\n"
+            "Away Only = only the away team gets standings credit.\n"
+            "Neither = friendly/exhibition, no standings impact."
+        ),
+    )
+
+    # Contextual explanation
+    if cf == "Both Teams":
+        st.markdown(
+            f'<div class="counts-banner">✅ Normal game — result counts for <b>both</b> teams in standings.</div>',
+            unsafe_allow_html=True,
+        )
+    elif cf == "Home Only":
+        ht = home_team or "Home team"
+        at = away_team or "Away team"
+        st.markdown(
+            f'<div class="counts-banner">⚠️ Result will count for <b>{ht}</b> only. <b>{at}</b> is the fill-in — their result does NOT affect standings.</div>',
+            unsafe_allow_html=True,
+        )
+    elif cf == "Away Only":
+        ht = home_team or "Home team"
+        at = away_team or "Away team"
+        st.markdown(
+            f'<div class="counts-banner">⚠️ Result will count for <b>{at}</b> only. <b>{ht}</b> is the fill-in — their result does NOT affect standings.</div>',
+            unsafe_allow_html=True,
+        )
+    elif cf == "Neither":
+        st.markdown(
+            f'<div class="counts-banner">🤝 Friendly / exhibition game — no standings impact for either team.</div>',
+            unsafe_allow_html=True,
+        )
+
+    return cf
+
+
+# ─────────────────────────────────────────────
 # PAGES
 # ─────────────────────────────────────────────
 def page_game_manager(df, division: str, teams: list[str]):
-    """
-    Unified Game Manager — schedule is the source of truth.
-    Every game row has inline actions: enter score, cancel, reschedule.
-    Separate tab for adding new games.
-    Logged match results are editable/deletable in a dedicated tab.
-    """
     st.markdown('<div class="section-header">📋 Game Manager</div>', unsafe_allow_html=True)
 
     sched_df = load_schedule_from_db(division)
@@ -1514,7 +1551,7 @@ def page_game_manager(df, division: str, teams: list[str]):
         "✏️ Edit / Delete Results",
     ])
 
-    # ── TAB 1: Schedule — main workhorse ─────────────────────────────────
+    # ── TAB 1: Schedule ───────────────────────────────────────────────────
     with tab_schedule:
         if sched_df.empty:
             st.info("No schedule loaded yet.")
@@ -1527,16 +1564,16 @@ def page_game_manager(df, division: str, teams: list[str]):
                 &nbsp;&nbsp;<span style="color:{PFC_SILVER};font-weight:700;">● Played</span>
                 &nbsp;&nbsp;<span style="color:{PFC_RED};font-weight:700;">● Canceled</span>
                 &nbsp;&nbsp;<span style="color:{PFC_ORANGE};font-weight:700;">● Bye</span>
-                {"&nbsp;&nbsp;— Click a game row to take action on it." if admin else "&nbsp;&nbsp;— Unlock admin in the sidebar to make changes."}
+                &nbsp;&nbsp;<span style="color:{PFC_PURPLE};font-weight:700;">● Partial Count</span>
+                {"&nbsp;&nbsp;— Click a game row to take action." if admin else "&nbsp;&nbsp;— Unlock admin in the sidebar to make changes."}
                 </div>
                 """,
                 unsafe_allow_html=True,
             )
 
-            # Week filter
-            weeks = ["All"] + sorted(sched_df["week"].unique().tolist())
             col_wf, col_sf = st.columns([1, 1])
             with col_wf:
+                weeks = ["All"] + sorted(sched_df["week"].unique().tolist())
                 sel_week = st.selectbox("Filter by Week", weeks, key="gm_week_filter")
             with col_sf:
                 sel_status = st.selectbox(
@@ -1561,12 +1598,14 @@ def page_game_manager(df, division: str, teams: list[str]):
                     badge = status_badge(status)
                     note_str = f" — <i>{row['notes']}</i>" if row.get("notes") else ""
 
-                    # Check if a result is already logged for this game
                     result_key = (str(row["game_date"]), str(row["home_team"]), str(row["away_team"]))
                     result_row = completed_map.get(result_key)
                     score_str = ""
+                    cf_badge_str = ""
                     if result_row is not None:
                         score_str = f"&nbsp;&nbsp;<b style='color:{PFC_NAVY}'>{int(result_row['home_goals'])} – {int(result_row['away_goals'])}</b>"
+                        cf = result_row.get("counts_for", "Both Teams") or "Both Teams"
+                        cf_badge_str = counts_for_badge(cf)
 
                     st.markdown(
                         f"""
@@ -1574,7 +1613,7 @@ def page_game_manager(df, division: str, teams: list[str]):
                             <b>Wk {int(row['week'])}</b> &nbsp;·&nbsp;
                             {format_display_date(row['game_date'])} {row['time']} &nbsp;·&nbsp;
                             <b>{row['home_team']}</b> vs <b>{row['away_team']}</b> &nbsp;·&nbsp;
-                            {row['location']} &nbsp; {badge}{score_str}{note_str}
+                            {row['location']} &nbsp; {badge}{score_str}{cf_badge_str}{note_str}
                         </div>
                         """,
                         unsafe_allow_html=True,
@@ -1591,45 +1630,66 @@ def page_game_manager(df, division: str, teams: list[str]):
 
                             if action == "⚽ Enter / Update Score":
                                 st.markdown(f"**Enter result for {row['home_team']} vs {row['away_team']}**")
-                                # Pre-fill if result already exists
+
                                 pre_hg = int(result_row["home_goals"]) if result_row is not None else 0
                                 pre_ag = int(result_row["away_goals"]) if result_row is not None else 0
                                 pre_notes = str(result_row["notes"]) if result_row is not None else ""
+                                pre_cf = str(result_row.get("counts_for", "Both Teams")) if result_row is not None else "Both Teams"
+                                if pre_cf not in COUNTS_OPTIONS:
+                                    pre_cf = "Both Teams"
 
-                                with st.form(f"score_form_{game_id}", clear_on_submit=False):
-                                    sc1, sc2, sc3 = st.columns(3)
-                                    with sc1:
-                                        hg = st.number_input(f"{row['home_team']} Goals", min_value=0, max_value=30, value=pre_hg, step=1, key=f"hg_{game_id}")
-                                    with sc2:
-                                        ag = st.number_input(f"{row['away_team']} Goals", min_value=0, max_value=30, value=pre_ag, step=1, key=f"ag_{game_id}")
-                                    with sc3:
-                                        match_notes = st.text_input("Match Notes", value=pre_notes, placeholder="e.g. Rain delay", key=f"mnotes_{game_id}")
+                                sc1, sc2, sc3 = st.columns(3)
+                                with sc1:
+                                    # ── FIX: inputs OUTSIDE form so values update live ──
+                                    hg = st.number_input(
+                                        f"{row['home_team']} Goals",
+                                        min_value=0, max_value=30, value=pre_hg, step=1,
+                                        key=f"hg_{game_id}"
+                                    )
+                                with sc2:
+                                    ag = st.number_input(
+                                        f"{row['away_team']} Goals",
+                                        min_value=0, max_value=30, value=pre_ag, step=1,
+                                        key=f"ag_{game_id}"
+                                    )
+                                with sc3:
+                                    match_notes = st.text_input(
+                                        "Match Notes", value=pre_notes,
+                                        placeholder="e.g. Rain delay",
+                                        key=f"mnotes_{game_id}"
+                                    )
 
-                                    save_score = st.form_submit_button("⚽ Save Score & Mark Played", use_container_width=True)
+                                st.markdown("---")
+                                # Counts-for selector — OUTSIDE form
+                                cf_val = counts_for_selector(
+                                    key=f"cf_{game_id}",
+                                    default=pre_cf,
+                                    home_team=row["home_team"],
+                                    away_team=row["away_team"],
+                                )
 
-                                if save_score:
+                                st.markdown("---")
+                                # ── Save button (plain button, not form submit) ──
+                                if st.button("⚽ Save Score & Mark Played", key=f"save_score_{game_id}", use_container_width=True, type="primary"):
                                     if result_row is not None:
-                                        # Update existing result
                                         update_match(
                                             int(result_row["id"]), division,
                                             int(row["week"]), row["game_date"],
                                             row["home_team"], row["away_team"],
-                                            hg, ag, match_notes,
+                                            hg, ag, match_notes, cf_val,
                                         )
                                     else:
-                                        # Insert new result
                                         insert_match(
                                             division, int(row["week"]), row["game_date"],
                                             row["home_team"], row["away_team"],
-                                            hg, ag, match_notes,
+                                            hg, ag, match_notes, cf_val,
                                         )
-                                    # Auto-mark the schedule entry as played
                                     set_game_status(game_id, "played", "")
-                                    st.success(f"Saved: {row['home_team']} {hg} – {ag} {row['away_team']}")
+                                    st.success(f"✅ Saved: {row['home_team']} {hg} – {ag} {row['away_team']} ({cf_val})")
                                     st.rerun()
 
                             elif action == "🗓️ Reschedule":
-                                st.markdown("**Move this game to a new date/time/location. Teams stay the same.**")
+                                st.markdown("**Move this game to a new date/time/location.**")
                                 with st.form(f"reschedule_form_{game_id}", clear_on_submit=False):
                                     rs1, rs2 = st.columns(2)
                                     with rs1:
@@ -1649,28 +1709,25 @@ def page_game_manager(df, division: str, teams: list[str]):
                             elif action == "🚫 Cancel":
                                 with st.form(f"cancel_form_{game_id}"):
                                     cancel_reason = st.text_input("Reason (optional)", placeholder="e.g. Field closed, weather", key=f"cancelreason_{game_id}")
-                                    confirm_cancel = st.form_submit_button("🚫 Confirm Cancellation", use_container_width=True)
-                                if confirm_cancel:
-                                    set_game_status(game_id, "canceled", cancel_reason)
-                                    st.success(f"Marked as Canceled: {row['home_team']} vs {row['away_team']}")
-                                    st.rerun()
+                                    if st.form_submit_button("🚫 Confirm Cancellation", use_container_width=True):
+                                        set_game_status(game_id, "canceled", cancel_reason)
+                                        st.success(f"Marked as Canceled: {row['home_team']} vs {row['away_team']}")
+                                        st.rerun()
 
                             elif action == "😴 Mark as Bye":
                                 with st.form(f"bye_form_{game_id}"):
                                     bye_notes = st.text_input("Notes (optional)", placeholder="e.g. Opponent no-show", key=f"byenotes_{game_id}")
-                                    confirm_bye = st.form_submit_button("😴 Confirm Bye", use_container_width=True)
-                                if confirm_bye:
-                                    set_game_status(game_id, "bye", bye_notes)
-                                    st.success(f"Marked as Bye: {row['home_team']} vs {row['away_team']}")
-                                    st.rerun()
+                                    if st.form_submit_button("😴 Confirm Bye", use_container_width=True):
+                                        set_game_status(game_id, "bye", bye_notes)
+                                        st.success(f"Marked as Bye: {row['home_team']} vs {row['away_team']}")
+                                        st.rerun()
 
                             elif action == "♻️ Restore to Scheduled":
                                 with st.form(f"restore_form_{game_id}"):
-                                    confirm_restore = st.form_submit_button("♻️ Restore to Scheduled", use_container_width=True)
-                                if confirm_restore:
-                                    set_game_status(game_id, "scheduled", "")
-                                    st.success(f"Restored to Scheduled: {row['home_team']} vs {row['away_team']}")
-                                    st.rerun()
+                                    if st.form_submit_button("♻️ Restore to Scheduled", use_container_width=True):
+                                        set_game_status(game_id, "scheduled", "")
+                                        st.success(f"Restored: {row['home_team']} vs {row['away_team']}")
+                                        st.rerun()
 
             st.caption(f"Showing {len(view_df)} game(s).")
 
@@ -1679,24 +1736,22 @@ def page_game_manager(df, division: str, teams: list[str]):
         if not require_admin("add games to the schedule"):
             st.stop()
 
-        st.markdown("Add a makeup game, extra fixture, or any game not already on the schedule.")
+        st.markdown("Add a makeup game, extra fixture, or any game not on the schedule.")
 
-        with st.form("add_game_form", clear_on_submit=True):
-            a1, a2, a3 = st.columns(3)
-            with a1:
-                add_week = st.number_input("Week", min_value=1, max_value=52, value=1, step=1, key="ag_week")
-                add_date = st.date_input("Date", value=date.today(), format="MM/DD/YYYY", key="ag_date")
-            with a2:
-                add_home = st.selectbox("Home Team", teams, key="ag_home")
-                add_time = st.text_input("Time", value="9:00 AM", placeholder="e.g. 10:30 AM", key="ag_time")
-            with a3:
-                add_away = st.selectbox("Away Team", teams, key="ag_away")
-                add_location = st.text_input("Location", value="", placeholder="e.g. Field 4", key="ag_loc")
+        a1, a2, a3 = st.columns(3)
+        with a1:
+            add_week = st.number_input("Week", min_value=1, max_value=52, value=1, step=1, key="ag_week")
+            add_date = st.date_input("Date", value=date.today(), format="MM/DD/YYYY", key="ag_date")
+        with a2:
+            add_home = st.selectbox("Home Team", teams, key="ag_home")
+            add_time = st.text_input("Time", value="9:00 AM", placeholder="e.g. 10:30 AM", key="ag_time")
+        with a3:
+            add_away = st.selectbox("Away Team", teams, key="ag_away")
+            add_location = st.text_input("Location", value="", placeholder="e.g. Field 4", key="ag_loc")
 
-            add_notes = st.text_input("Notes (optional)", placeholder="e.g. Makeup game from Week 3 cancellation", key="ag_notes")
-            add_submitted = st.form_submit_button("➕ Add Game to Schedule", use_container_width=True)
+        add_notes = st.text_input("Notes (optional)", placeholder="e.g. Makeup game from Week 3 cancellation", key="ag_notes")
 
-        if add_submitted:
+        if st.button("➕ Add Game to Schedule", key="add_game_btn", use_container_width=True, type="primary"):
             if add_home == add_away:
                 st.error("A team cannot play itself.")
             else:
@@ -1712,12 +1767,12 @@ def page_game_manager(df, division: str, teams: list[str]):
         if df.empty:
             st.info("No results logged yet.")
         else:
-            st.markdown("Edit or delete a previously logged match result. This does **not** affect the schedule entry.")
+            st.markdown("Edit or delete a previously logged match result.")
 
             manage_df = prep_match_display(df.copy())
             manage_df["Score"] = manage_df["home_goals"].astype(str) + "–" + manage_df["away_goals"].astype(str)
-            display_list = manage_df[["id", "week", "game_date", "home_team", "Score", "away_team", "notes"]].copy()
-            display_list.columns = ["ID", "Week", "Date", "Home", "Score", "Away", "Notes"]
+            display_list = manage_df[["id", "week", "game_date", "home_team", "Score", "away_team", "counts_for", "notes"]].copy()
+            display_list.columns = ["ID", "Week", "Date", "Home", "Score", "Away", "Counts For", "Notes"]
             st.dataframe(display_list, use_container_width=True, hide_index=True)
 
             selected_id = st.selectbox(
@@ -1735,38 +1790,49 @@ def page_game_manager(df, division: str, teams: list[str]):
             )
 
             sel = manage_df[manage_df["id"] == selected_id].iloc[0]
+            pre_cf = str(sel.get("counts_for", "Both Teams"))
+            if pre_cf not in COUNTS_OPTIONS:
+                pre_cf = "Both Teams"
 
-            with st.form(f"edit_result_form_{selected_id}"):
-                ec1, ec2, ec3 = st.columns(3)
-                with ec1:
-                    e_week = st.number_input("Week", min_value=1, max_value=52, value=int(sel["week"]), step=1)
-                    e_date = st.date_input("Date", value=parse_to_date(sel["game_date"]), format="MM/DD/YYYY")
-                with ec2:
-                    e_home = st.selectbox("Home Team", teams, index=teams.index(sel["home_team"]) if sel["home_team"] in teams else 0)
-                    e_hg = st.number_input("Home Goals", min_value=0, max_value=30, value=int(sel["home_goals"]), step=1)
-                with ec3:
-                    e_away = st.selectbox("Away Team", teams, index=teams.index(sel["away_team"]) if sel["away_team"] in teams else 0)
-                    e_ag = st.number_input("Away Goals", min_value=0, max_value=30, value=int(sel["away_goals"]), step=1)
+            ec1, ec2, ec3 = st.columns(3)
+            with ec1:
+                e_week = st.number_input("Week", min_value=1, max_value=52, value=int(sel["week"]), step=1, key="edit_week")
+                e_date = st.date_input("Date", value=parse_to_date(sel["game_date"]), format="MM/DD/YYYY", key="edit_date")
+            with ec2:
+                e_home = st.selectbox("Home Team", teams, index=teams.index(sel["home_team"]) if sel["home_team"] in teams else 0, key="edit_home")
+                e_hg = st.number_input("Home Goals", min_value=0, max_value=30, value=int(sel["home_goals"]), step=1, key="edit_hg")
+            with ec3:
+                e_away = st.selectbox("Away Team", teams, index=teams.index(sel["away_team"]) if sel["away_team"] in teams else 0, key="edit_away")
+                e_ag = st.number_input("Away Goals", min_value=0, max_value=30, value=int(sel["away_goals"]), step=1, key="edit_ag")
 
-                e_notes = st.text_input("Notes", value=str(sel["notes"]))
-                col_sv, col_del = st.columns(2)
-                do_save = col_sv.form_submit_button("💾 Save Changes", use_container_width=True)
-                do_delete = col_del.form_submit_button("🗑️ Delete Result", use_container_width=True)
+            e_notes = st.text_input("Notes", value=str(sel["notes"]), key="edit_notes")
 
-            if do_save:
+            st.markdown("---")
+            e_cf = counts_for_selector(
+                key="edit_cf",
+                default=pre_cf,
+                home_team=str(sel["home_team"]),
+                away_team=str(sel["away_team"]),
+            )
+
+            st.markdown("---")
+            col_sv, col_del = st.columns(2)
+
+            if col_sv.button("💾 Save Changes", key="save_edit_btn", use_container_width=True, type="primary"):
                 if e_home == e_away:
                     st.error("A team cannot play itself.")
                 elif match_exists(division, e_week, e_date, e_home, e_away, e_hg, e_ag, exclude_id=int(sel["id"])):
-                    st.warning("That exact result already exists. No changes saved.")
+                    st.warning("That exact result already exists.")
                 else:
-                    update_match(int(sel["id"]), division, e_week, e_date, e_home, e_away, e_hg, e_ag, e_notes)
+                    update_match(int(sel["id"]), division, e_week, e_date, e_home, e_away, e_hg, e_ag, e_notes, e_cf)
                     st.success("Result updated.")
                     st.rerun()
 
-            if do_delete:
+            if col_del.button("🗑️ Delete Result", key="delete_edit_btn", use_container_width=True):
                 delete_match(int(sel["id"]))
                 st.success("Result deleted.")
                 st.rerun()
+
 
 def page_teams(division: str, teams: list[str]):
     st.markdown('<div class="section-header">👥 Team Management</div>', unsafe_allow_html=True)
@@ -1824,7 +1890,7 @@ def page_teams(division: str, teams: list[str]):
                     st.success(f"Deleted {team_to_delete}.")
                     st.rerun()
                 else:
-                    st.error("This team already has matches logged. Delete the matches first or rename the team instead.")
+                    st.error("This team already has matches logged. Delete the matches first or rename instead.")
 
     st.markdown("#### Current Teams")
     st.dataframe(pd.DataFrame({"Team": sorted(teams)}), width="stretch", hide_index=True)
@@ -1853,11 +1919,20 @@ def page_match_history(df, teams: list[str]):
 
     display = prep_match_display(filtered.copy())
     display["Score"] = display["home_goals"].astype(str) + " – " + display["away_goals"].astype(str)
-    display = display[["week", "game_date", "home_team", "Score", "away_team", "notes"]]
-    display.columns = ["Week", "Date", "Home", "Score", "Away", "Notes"]
+    display = display[["week", "game_date", "home_team", "Score", "away_team", "counts_for", "notes"]]
+    display.columns = ["Week", "Date", "Home", "Score", "Away", "Counts For", "Notes"]
 
     st.dataframe(display.reset_index(drop=True), width="stretch", hide_index=True)
     st.caption(f"Showing {len(display)} match(es)")
+
+    # Call out any partial-count games
+    partial = display[display["Counts For"] != "Both Teams"]
+    if not partial.empty:
+        st.markdown(
+            f'<div class="info-strip">⚠️ <b>{len(partial)} game(s)</b> in this view have partial standings impact '
+            f'(Home Only, Away Only, or Friendly). These are excluded from or partially applied to standings calculations.</div>',
+            unsafe_allow_html=True,
+        )
 
 
 def page_standings(df, teams: list[str]):
@@ -1867,6 +1942,7 @@ def page_standings(df, teams: list[str]):
         <div class="info-strip">
         <b>Official rules:</b> Win = 3 points, Draw = 1 point, Loss = 0 points.
         Goal differential is capped at <b>±4 per match</b> for standings only.
+        Games marked "Home Only", "Away Only", or "Friendly" apply standings credit only to the applicable team(s).
         </div>
         """,
         unsafe_allow_html=True,
@@ -1919,10 +1995,11 @@ def page_power_rankings(df, teams: list[str]):
     st.markdown(
         f"""
         <div class="info-strip">
-        <b>How power rankings work:</b> These are not the official standings.
-        Power rankings estimate team strength using <b>Elo rating</b>, <b>strength of schedule</b>,
-        <b>weighted last-5 form index</b>, <b>goal differential momentum</b>, <b>upset impact</b>,
-        and uncapped scoring margin.
+        <b>How power rankings work:</b> Not the same as official standings.
+        Power rankings use <b>Elo rating</b>, <b>strength of schedule</b>,
+        <b>weighted last-5 form index</b>, <b>goal differential momentum</b>, and <b>upset impact</b>.
+        Elo always updates regardless of "Counts For" setting — because the game was played.
+        Form and standings stats respect the "Counts For" setting.
         </div>
         """,
         unsafe_allow_html=True,
@@ -1973,12 +2050,14 @@ def page_dashboard(df, division: str, teams: list[str]):
     total_goals = int(df["home_goals"].sum() + df["away_goals"].sum())
     avg_goals = round(total_goals / max(len(df), 1), 1)
     current_week = int(df["week"].max())
+    partial_count = len(df[df["counts_for"] != "Both Teams"]) if "counts_for" in df.columns else 0
 
-    m1, m2, m3, m4 = st.columns(4)
+    m1, m2, m3, m4, m5 = st.columns(5)
     m1.metric("Total Goals", total_goals)
     m2.metric("Avg Goals / Match", avg_goals)
     m3.metric("Matches Played", len(df))
     m4.metric("Current Week", current_week)
+    m5.metric("Partial-Count Games", partial_count)
 
     st.divider()
 
@@ -2009,30 +2088,16 @@ def page_dashboard(df, division: str, teams: list[str]):
     hottest_form = team_analytics.sort_values("Form Index", ascending=False).iloc[0]
     best_momentum = team_analytics.sort_values("GD Momentum", ascending=False).iloc[0]
 
-    with c1:
-        st.markdown(
-            f'<div class="mini-card"><b>Best Attack</b><br><span style="font-size:1.1rem;font-weight:900;color:{PFC_NAVY};">{best_attack["Team"]}</span><br>{best_attack["GF/Game"]} goals/game<div class="mini-label">Highest goals scored per game.</div></div>',
-            unsafe_allow_html=True
-        )
-    with c2:
-        st.markdown(
-            f'<div class="mini-card"><b>Best Defense</b><br><span style="font-size:1.1rem;font-weight:900;color:{PFC_NAVY};">{best_defense["Team"]}</span><br>{best_defense["GA/Game"]} allowed/game<div class="mini-label">Fewest goals allowed per game.</div></div>',
-            unsafe_allow_html=True
-        )
-    with c3:
-        st.markdown(
-            f'<div class="mini-card"><b>Toughest Schedule</b><br><span style="font-size:1.1rem;font-weight:900;color:{PFC_NAVY};">{toughest_sched["Team"]}</span><br>SOS {toughest_sched["Strength of Schedule"]}<div class="mini-label">Strength of Schedule = average opponent strength faced.</div></div>',
-            unsafe_allow_html=True
-        )
-    with c4:
-        st.markdown(
-            f'<div class="mini-card"><b>Best Form</b><br><span style="font-size:1.1rem;font-weight:900;color:{PFC_NAVY};">{hottest_form["Team"]}</span><br>Index {hottest_form["Form Index"]}<div class="mini-label">Weighted performance over the last 5 matches.</div></div>',
-            unsafe_allow_html=True
-        )
-    with c5:
-        st.markdown(
-            f'<div class="mini-card"><b>Best GD Momentum</b><br><span style="font-size:1.1rem;font-weight:900;color:{PFC_NAVY};">{best_momentum["Team"]}</span><br>{best_momentum["GD Momentum"]}<div class="mini-label">Recent trend in scoring margin.</div></div>',
-            unsafe_allow_html=True
+    for col, label, team_row, stat, desc in [
+        (c1, "Best Attack", best_attack, f'{best_attack["GF/Game"]} goals/game', "Highest goals scored per game."),
+        (c2, "Best Defense", best_defense, f'{best_defense["GA/Game"]} allowed/game', "Fewest goals allowed per game."),
+        (c3, "Toughest Schedule", toughest_sched, f'SOS {toughest_sched["Strength of Schedule"]}', "Average Elo of opponents faced."),
+        (c4, "Best Form", hottest_form, f'Index {hottest_form["Form Index"]}', "Weighted last-5 performance."),
+        (c5, "Best Momentum", best_momentum, f'{best_momentum["GD Momentum"]}', "Recent scoring margin trend."),
+    ]:
+        col.markdown(
+            f'<div class="mini-card"><b>{label}</b><br><span style="font-size:1.1rem;font-weight:900;color:{PFC_NAVY};">{team_row["Team"]}</span><br>{stat}<div class="mini-label">{desc}</div></div>',
+            unsafe_allow_html=True,
         )
 
     st.divider()
@@ -2054,23 +2119,9 @@ def page_dashboard(df, division: str, teams: list[str]):
     with chart_left:
         st.markdown("#### Points by Team")
         pts_df = standings.reset_index()[["Team", "Pts"]].sort_values("Pts", ascending=False)
-        fig_pts = px.bar(
-            pts_df,
-            x="Team",
-            y="Pts",
-            text="Pts",
-            color="Pts",
-            color_continuous_scale=["#C9D7FA", PFC_NAVY]
-        )
+        fig_pts = px.bar(pts_df, x="Team", y="Pts", text="Pts", color="Pts", color_continuous_scale=["#C9D7FA", PFC_NAVY])
         fig_pts.update_traces(textposition="outside")
-        fig_pts.update_layout(
-            paper_bgcolor=PFC_WHITE,
-            plot_bgcolor=PFC_WHITE,
-            font_color=PFC_DARK,
-            showlegend=False,
-            coloraxis_showscale=False,
-            margin=dict(l=20, r=20, t=30, b=20),
-        )
+        fig_pts.update_layout(paper_bgcolor=PFC_WHITE, plot_bgcolor=PFC_WHITE, font_color=PFC_DARK, showlegend=False, coloraxis_showscale=False, margin=dict(l=20, r=20, t=30, b=20))
         st.plotly_chart(fig_pts, width="stretch")
 
     with chart_right:
@@ -2079,13 +2130,7 @@ def page_dashboard(df, division: str, teams: list[str]):
         fig_gfga = go.Figure()
         fig_gfga.add_trace(go.Bar(name="Goals For", x=gf_ga["Team"], y=gf_ga["GF"], marker_color=PFC_BLUE))
         fig_gfga.add_trace(go.Bar(name="Goals Against", x=gf_ga["Team"], y=gf_ga["GA"], marker_color=PFC_SILVER))
-        fig_gfga.update_layout(
-            barmode="group",
-            paper_bgcolor=PFC_WHITE,
-            plot_bgcolor=PFC_WHITE,
-            font_color=PFC_DARK,
-            margin=dict(l=20, r=20, t=30, b=20),
-        )
+        fig_gfga.update_layout(barmode="group", paper_bgcolor=PFC_WHITE, plot_bgcolor=PFC_WHITE, font_color=PFC_DARK, margin=dict(l=20, r=20, t=30, b=20))
         st.plotly_chart(fig_gfga, width="stretch")
 
     st.divider()
@@ -2096,9 +2141,12 @@ def page_dashboard(df, division: str, teams: list[str]):
         st.markdown("#### Recent Results")
         recent = prep_match_display(df.sort_values(["week", "game_date", "id"], ascending=False).head(6).copy())
         for _, row in recent.iterrows():
+            cf = row.get("counts_for", "Both Teams") or "Both Teams"
+            cf_note = f" *({cf})*" if cf != "Both Teams" else ""
             st.markdown(
                 f"**Wk {int(row['week'])}** · {row['game_date']} · "
                 f"{row['home_team']} **{int(row['home_goals'])}-{int(row['away_goals'])}** {row['away_team']}"
+                + cf_note
                 + (f"  —  *{row['notes']}*" if row["notes"] else "")
             )
 
@@ -2107,7 +2155,7 @@ def page_dashboard(df, division: str, teams: list[str]):
         impact["Date"] = impact["Date"].apply(format_display_date)
         impact["Match"] = impact["Home"] + " " + impact["Score"] + " " + impact["Away"]
         st.dataframe(
-            impact[["Week", "Date", "Match", "Expected Winner", "Winner", "Upset Probability", "Total Impact"]],
+            impact[["Week", "Date", "Match", "Counts For", "Expected Winner", "Winner", "Upset Probability", "Total Impact"]],
             width="stretch",
             hide_index=True,
         )
@@ -2137,10 +2185,9 @@ def page_dashboard(df, division: str, teams: list[str]):
     st.markdown(
         f"""
         <div class="info-strip">
-        <b>Analytics notes:</b> Official standings still use capped goal differential.
-        This dashboard also includes an <b>Elo team rating system</b>, <b>strength of schedule index</b>,
-        <b>weighted last-5 form index</b>, <b>goal differential momentum model</b>, and an
-        <b>upset probability model</b> to estimate current team strength and upcoming match risk.
+        <b>Analytics notes:</b> Official standings use capped goal differential.
+        Games with a partial "Counts For" setting apply credit only to the applicable team(s).
+        Power rankings Elo always updates regardless of "Counts For" — because the game was played.
         </div>
         """,
         unsafe_allow_html=True,
@@ -2152,13 +2199,8 @@ def page_notes(division: str):
 
     if is_admin():
         with st.form(f"note_form_{division}", clear_on_submit=True):
-            note_text = st.text_area(
-                "Add a new note or announcement",
-                height=120,
-                placeholder="e.g. Next games moved to Saturday due to field maintenance..."
-            )
+            note_text = st.text_area("Add a new note or announcement", height=120, placeholder="e.g. Next games moved to Saturday...")
             submitted = st.form_submit_button("📌 Post Note", width="stretch")
-
         if submitted and note_text.strip():
             insert_note(division, note_text.strip())
             st.success("Note posted.")
@@ -2192,20 +2234,13 @@ def page_export(df, division: str, teams: list[str]):
 
     history_export = prep_match_display(df.copy())
     history_export["Score"] = history_export["home_goals"].astype(str) + " – " + history_export["away_goals"].astype(str)
-    history_export = history_export[["week", "game_date", "home_team", "Score", "away_team", "notes"]]
-    history_export.columns = ["Week", "Date", "Home", "Score", "Away", "Notes"]
+    history_export = history_export[["week", "game_date", "home_team", "Score", "away_team", "counts_for", "notes"]]
+    history_export.columns = ["Week", "Date", "Home", "Score", "Away", "Counts For", "Notes"]
 
-    pdf_bytes = make_league_summary_pdf(
-        division=division,
-        standings=standings,
-        pr=pr,
-        recent_results=history_export,
-        analytics_df=team_analytics,
-    )
+    pdf_bytes = make_league_summary_pdf(division, standings, pr, history_export, team_analytics)
     png_bytes = make_power_rankings_png(pr, movement, division)
     dashboard_pdf = make_dashboard_pdf(division, df, teams)
 
-    # Schedule export
     sched_export = load_schedule_from_db(division).copy()
     if not sched_export.empty:
         sched_export["game_date"] = sched_export["game_date"].apply(format_display_date)
@@ -2215,59 +2250,29 @@ def page_export(df, division: str, teams: list[str]):
     col1, col2, col3, col4, col5, col6 = st.columns(6)
 
     with col1:
-        st.download_button(
-            "📄 League Summary PDF",
-            data=pdf_bytes,
+        st.download_button("📄 League Summary PDF", data=pdf_bytes,
             file_name=f"{division.lower().replace(' ', '_')}_summary_{datetime.now().strftime('%m%d%Y')}.pdf",
-            mime="application/pdf",
-            width="stretch",
-        )
-
+            mime="application/pdf", width="stretch")
     with col2:
-        st.download_button(
-            "📄 Dashboard PDF",
-            data=dashboard_pdf,
+        st.download_button("📄 Dashboard PDF", data=dashboard_pdf,
             file_name=f"{division.lower().replace(' ', '_')}_dashboard_{datetime.now().strftime('%m%d%Y')}.pdf",
-            mime="application/pdf",
-            width="stretch",
-        )
-
+            mime="application/pdf", width="stretch")
     with col3:
-        st.download_button(
-            "🖼️ Power Rankings PNG",
-            data=png_bytes,
+        st.download_button("🖼️ Power Rankings PNG", data=png_bytes,
             file_name=f"{division.lower().replace(' ', '_')}_power_rankings_{datetime.now().strftime('%m%d%Y')}.png",
-            mime="image/png",
-            width="stretch",
-        )
-
+            mime="image/png", width="stretch")
     with col4:
-        st.download_button(
-            "📋 Standings CSV",
-            data=df_to_csv_bytes(standings.reset_index()),
-            file_name=f"{division.lower().replace(' ', '_')}_standings.csv",
-            mime="text/csv",
-            width="stretch",
-        )
-
+        st.download_button("📋 Standings CSV", data=df_to_csv_bytes(standings.reset_index()),
+            file_name=f"{division.lower().replace(' ', '_')}_standings.csv", mime="text/csv", width="stretch")
     with col5:
-        st.download_button(
-            "📅 Match History CSV",
-            data=df_to_csv_bytes(history_export),
-            file_name=f"{division.lower().replace(' ', '_')}_match_history.csv",
-            mime="text/csv",
-            width="stretch",
-        )
-
+        st.download_button("📅 Match History CSV", data=df_to_csv_bytes(history_export),
+            file_name=f"{division.lower().replace(' ', '_')}_match_history.csv", mime="text/csv", width="stretch")
     with col6:
         if not sched_export.empty:
-            st.download_button(
-                "🗓️ Schedule CSV",
-                data=df_to_csv_bytes(sched_export),
+            st.download_button("🗓️ Schedule CSV", data=df_to_csv_bytes(sched_export),
                 file_name=f"{division.lower().replace(' ', '_')}_schedule_{datetime.now().strftime('%m%d%Y')}.csv",
-                mime="text/csv",
-                width="stretch",
-            )
+                mime="text/csv", width="stretch")
+
 
 # ─────────────────────────────────────────────
 # MAIN
@@ -2278,16 +2283,8 @@ def main():
 
     st.sidebar.title("Pensacola FC")
     st.sidebar.markdown("**Division**")
-    selected_division = st.sidebar.radio(
-        "Division",
-        DIVISIONS,
-        index=0,
-        label_visibility="collapsed",
-    )
-    st.sidebar.markdown(
-        f'<div class="active-division-chip">Active: {selected_division}</div>',
-        unsafe_allow_html=True,
-    )
+    selected_division = st.sidebar.radio("Division", DIVISIONS, index=0, label_visibility="collapsed")
+    st.sidebar.markdown(f'<div class="active-division-chip">Active: {selected_division}</div>', unsafe_allow_html=True)
 
     teams = load_division_teams(selected_division)
     df = load_matches(selected_division)
