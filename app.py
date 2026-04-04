@@ -17,6 +17,7 @@ Multi-division youth soccer league dashboard with:
 - password-protected admin editing
 - PDF / PNG / CSV exports
 - partial-count games (counts for both, home only, away only, or neither)
+- playoff picture predictor (top 4 eligible teams)
 """
 
 import streamlit as st
@@ -53,6 +54,15 @@ ADMIN_PASSWORD = "cobras2026"
 
 # counts_for options
 COUNTS_OPTIONS = ["Both Teams", "Home Only", "Away Only", "Neither"]
+
+# ─────────────────────────────────────────────
+# PLAYOFF CONFIG
+# ─────────────────────────────────────────────
+PLAYOFF_ELIGIBLE_TEAMS = {
+    "U15 Boys": ["Beavers", "Cobras", "Vipers", "Los Locos", "Pelicans", "Athletico"],
+    "U15 Girls": ["PSY City", "Shockwaves", "Tator Tots", "Team Seth"],
+}
+PLAYOFF_SPOTS = 4
 
 DEFAULT_TEAMS = {
     "U15 Boys": [
@@ -333,7 +343,6 @@ def init_db():
         c.execute("ALTER TABLE league_notes ADD COLUMN division TEXT DEFAULT 'U15 Boys'")
         conn.commit()
 
-    # NEW: add counts_for column if missing (migration for existing DBs)
     if not column_exists(conn, "matches", "counts_for"):
         c.execute("ALTER TABLE matches ADD COLUMN counts_for TEXT DEFAULT 'Both Teams'")
         conn.commit()
@@ -608,10 +617,6 @@ def set_game_status(game_id: int, status: str, notes: str = ""):
 # ─────────────────────────────────────────────
 
 def counts_for_team(counts_for: str, side: str) -> bool:
-    """
-    Returns True if this match row should count for the given side.
-    side: 'home' or 'away'
-    """
     if counts_for == "Both Teams":
         return True
     if counts_for == "Home Only":
@@ -620,7 +625,7 @@ def counts_for_team(counts_for: str, side: str) -> bool:
         return side == "away"
     if counts_for == "Neither":
         return False
-    return True  # default safe fallback
+    return True
 
 
 def normalize_series(s: pd.Series) -> pd.Series:
@@ -658,7 +663,6 @@ def compute_standings(df: pd.DataFrame, teams: list[str]) -> pd.DataFrame:
         raw_gd = hg - ag
         capped = int(np.clip(raw_gd, -4, 4))
 
-        # Determine match outcome
         if hg > ag:
             home_result, away_result = "W", "L"
         elif hg < ag:
@@ -666,8 +670,7 @@ def compute_standings(df: pd.DataFrame, teams: list[str]) -> pd.DataFrame:
         else:
             home_result, away_result = "D", "D"
 
-        # Apply stats only if it counts for that team
-        if home_counts:
+        if home_counts and h in records:
             records[h]["GP"] += 1
             records[h]["GF"] += hg
             records[h]["GA"] += ag
@@ -681,7 +684,7 @@ def compute_standings(df: pd.DataFrame, teams: list[str]) -> pd.DataFrame:
             else:
                 records[h]["L"] += 1
 
-        if away_counts:
+        if away_counts and a in records:
             records[a]["GP"] += 1
             records[a]["GF"] += ag
             records[a]["GA"] += hg
@@ -757,8 +760,8 @@ def compute_power_package(df: pd.DataFrame, teams: list[str]):
         home_counts = counts_for_team(cf, "home")
         away_counts = counts_for_team(cf, "away")
 
-        pre_h = elo[h]
-        pre_a = elo[a]
+        pre_h = elo.get(h, 1500.0)
+        pre_a = elo.get(a, 1500.0)
 
         exp_h = 1 / (1 + 10 ** ((pre_a - pre_h) / 400))
         exp_a = 1 - exp_h
@@ -782,7 +785,6 @@ def compute_power_package(df: pd.DataFrame, teams: list[str]):
             res_h, res_a = "D", "D"
             underdog_win = abs(exp_h - 0.5) > 0.15
 
-        # Elo always updates regardless of counts_for (reflects actual game played)
         goal_diff = abs(hg - ag)
         recency_w = 1.0 + 0.08 * (idx / max(n_matches - 1, 1))
         mov_mult = 1.0 + 0.10 * min(goal_diff, 8)
@@ -790,18 +792,19 @@ def compute_power_package(df: pd.DataFrame, teams: list[str]):
         k = 32 * recency_w * mov_mult * (1 + upset_score)
         delta_h = k * (act_h - exp_h)
         delta_a = k * (act_a - exp_a)
-        elo[h] += delta_h
-        elo[a] += delta_a
+        if h in elo:
+            elo[h] += delta_h
+        if a in elo:
+            elo[a] += delta_a
 
-        # Form/stats only for teams where it counts
-        if home_counts:
+        if home_counts and h in form_points:
             form_points[h].append(pts_h)
             match_points[h].append(pts_h)
             raw_gd[h].append(hg - ag)
             results_text[h].append(res_h)
             opp_pre_elo[h].append(pre_a)
 
-        if away_counts:
+        if away_counts and a in form_points:
             form_points[a].append(pts_a)
             match_points[a].append(pts_a)
             raw_gd[a].append(ag - hg)
@@ -812,8 +815,6 @@ def compute_power_package(df: pd.DataFrame, teams: list[str]):
         expected_winner_prob = max(exp_h, exp_a)
         actual_result_prob = exp_h if hg > ag else exp_a if hg < ag else (1 - abs(exp_h - 0.5))
         upset_probability = round((1 - actual_result_prob) * 100, 1)
-
-        counts_label = cf if cf != "Both Teams" else ""
 
         match_logs.append({
             "Week": int(row["week"]),
@@ -885,7 +886,7 @@ def compute_power_package(df: pd.DataFrame, teams: list[str]):
         gf_pg = round(row["GF"] / gp, 2) if gp else 0
         ga_pg = round(row["GA"] / gp, 2) if gp else 0
 
-        gd_std = round(float(np.std(raw_gd[team])), 2) if raw_gd[team] else 0.0
+        gd_std = round(float(np.std(raw_gd[team])), 2) if raw_gd.get(team) else 0.0
         if gp <= 1:
             consistency = "Early"
         elif gd_std <= 1.2:
@@ -1057,6 +1058,461 @@ def compute_upcoming_predictions(df: pd.DataFrame, division: str, teams: list[st
 
 
 # ─────────────────────────────────────────────
+# PLAYOFF PICTURE
+# ─────────────────────────────────────────────
+
+def compute_playoff_picture(df: pd.DataFrame, division: str, teams: list[str]):
+    """
+    Returns playoff picture data:
+      - current: eligible teams ranked by current pts
+      - projected: eligible teams ranked by projected final pts
+      - clinched: teams mathematically guaranteed a spot
+      - eliminated: teams mathematically out
+      - bubble: everyone else
+      - remaining_games: dict of remaining game count per eligible team
+      - remaining_df: DataFrame of remaining head-to-head matchups
+    """
+    eligible = PLAYOFF_ELIGIBLE_TEAMS.get(division, teams)
+
+    # Current standings filtered to eligible only
+    full_standings = compute_standings(df, teams).reset_index()
+    eligible_standings = full_standings[full_standings["Team"].isin(eligible)].copy()
+    eligible_standings = eligible_standings.sort_values(
+        ["Pts", "GD", "GF"], ascending=[False, False, False]
+    ).reset_index(drop=True)
+    eligible_standings.index += 1
+    eligible_standings.index.name = "Playoff Rank"
+
+    # Find remaining scheduled games between eligible teams only
+    sched_df = load_schedule_from_db(division)
+    completed_keys = set(
+        zip(df["game_date"].astype(str), df["home_team"].astype(str), df["away_team"].astype(str))
+    ) if not df.empty else set()
+
+    remaining = []
+    if not sched_df.empty:
+        for _, row in sched_df.iterrows():
+            if row["status"] != "scheduled":
+                continue
+            key = (str(row["game_date"]), str(row["home_team"]), str(row["away_team"]))
+            if key in completed_keys:
+                continue
+            if row["home_team"] in eligible and row["away_team"] in eligible:
+                remaining.append(row)
+
+    remaining_df = pd.DataFrame(remaining) if remaining else pd.DataFrame()
+
+    # Count remaining games per team
+    remaining_counts = {t: 0 for t in eligible}
+    if not remaining_df.empty:
+        for _, row in remaining_df.iterrows():
+            h, a = row["home_team"], row["away_team"]
+            if h in remaining_counts:
+                remaining_counts[h] += 1
+            if a in remaining_counts:
+                remaining_counts[a] += 1
+
+    current_pts = {row["Team"]: int(row["Pts"]) for _, row in eligible_standings.iterrows()}
+    max_possible = {t: current_pts.get(t, 0) + remaining_counts[t] * 3 for t in eligible}
+
+    # Cutoff: what are the current top-4 pts
+    sorted_pts = sorted(current_pts.values(), reverse=True)
+    cutoff_pts = sorted_pts[PLAYOFF_SPOTS - 1] if len(sorted_pts) >= PLAYOFF_SPOTS else 0
+
+    # For clinched logic: what's the max the 5th-place team can reach?
+    sorted_teams_by_pts = sorted(current_pts.items(), key=lambda x: x[1], reverse=True)
+    if len(sorted_teams_by_pts) > PLAYOFF_SPOTS:
+        fifth_team = sorted_teams_by_pts[PLAYOFF_SPOTS][0]
+        fifth_max = max_possible.get(fifth_team, 0)
+    else:
+        fifth_max = 0
+
+    clinched = []
+    eliminated = []
+    bubble = []
+
+    for team in eligible:
+        pts = current_pts.get(team, 0)
+        max_pts = max_possible.get(team, 0)
+
+        # Clinched: current pts exceed what 5th place can max out at
+        if len(sorted_teams_by_pts) > PLAYOFF_SPOTS and pts > fifth_max:
+            clinched.append(team)
+        # Eliminated: even winning all remaining games can't reach 4th place pts
+        elif max_pts < cutoff_pts:
+            eliminated.append(team)
+        else:
+            bubble.append(team)
+
+    # Projected final points using probabilistic model
+    pr, _, analytics = compute_power_package(df, teams)
+    pr_map = pr.set_index("Team").to_dict(orient="index")
+    analytics_map = analytics.set_index("Team").to_dict(orient="index")
+
+    projected_pts = {t: float(current_pts.get(t, 0)) for t in eligible}
+
+    if not remaining_df.empty:
+        for _, row in remaining_df.iterrows():
+            h, a = row["home_team"], row["away_team"]
+            if h not in eligible or a not in eligible:
+                continue
+
+            h_elo = pr_map.get(h, {}).get("Elo Rating", 1500.0)
+            a_elo = pr_map.get(a, {}).get("Elo Rating", 1500.0)
+            h_form = analytics_map.get(h, {}).get("Form Index", 1.5)
+            a_form = analytics_map.get(a, {}).get("Form Index", 1.5)
+            h_gdm = analytics_map.get(h, {}).get("GD Momentum", 0.0)
+            a_gdm = analytics_map.get(a, {}).get("GD Momentum", 0.0)
+
+            blended_h = h_elo + 35 + (h_form - a_form) * 30 + (h_gdm - a_gdm) * 18
+            blended_a = a_elo + (a_form - h_form) * 30 + (a_gdm - h_gdm) * 18
+            diff = blended_h - blended_a
+
+            h_win_prob = 1 / (1 + 10 ** (-diff / 400))
+            a_win_prob = 1 - h_win_prob
+            draw_prob = 0.22
+            h_win_prob_adj = h_win_prob * (1 - draw_prob)
+            a_win_prob_adj = a_win_prob * (1 - draw_prob)
+
+            projected_pts[h] = projected_pts.get(h, 0) + round(h_win_prob_adj * 3 + draw_prob * 1, 2)
+            projected_pts[a] = projected_pts.get(a, 0) + round(a_win_prob_adj * 3 + draw_prob * 1, 2)
+
+    projected_rows = []
+    for team in eligible:
+        proj = round(projected_pts.get(team, 0), 1)
+        curr = current_pts.get(team, 0)
+        if team in clinched:
+            status = "🏆 Clinched"
+        elif team in eliminated:
+            status = "❌ Eliminated"
+        else:
+            status = "🔥 Bubble"
+
+        projected_rows.append({
+            "Team": team,
+            "Current Pts": curr,
+            "Projected Pts": proj,
+            "Remaining Games": remaining_counts.get(team, 0),
+            "Max Possible Pts": max_possible.get(team, 0),
+            "Status": status,
+        })
+
+    projected_df = pd.DataFrame(projected_rows).sort_values(
+        ["Projected Pts", "Current Pts"], ascending=[False, False]
+    ).reset_index(drop=True)
+    projected_df.index += 1
+    projected_df.index.name = "Proj Rank"
+
+    return {
+        "current": eligible_standings,
+        "projected": projected_df,
+        "clinched": clinched,
+        "eliminated": eliminated,
+        "bubble": bubble,
+        "remaining_games": remaining_counts,
+        "remaining_df": remaining_df,
+    }
+
+
+def render_playoff_picture(df: pd.DataFrame, division: str, teams: list[str]):
+    """Renders the full playoff picture section inside the dashboard."""
+
+    eligible = PLAYOFF_ELIGIBLE_TEAMS.get(division, [])
+    if not eligible:
+        return
+
+    st.markdown('<div class="section-header">🏟️ Playoff Picture</div>', unsafe_allow_html=True)
+
+    # Early data gate — need at least some matches to project anything meaningful
+    if df.empty:
+        st.info("No match results logged yet. Playoff projections will appear once games are recorded.")
+        return
+
+    pp = compute_playoff_picture(df, division, teams)
+    projected = pp["projected"].reset_index()
+    clinched = pp["clinched"]
+    eliminated = pp["eliminated"]
+    bubble = pp["bubble"]
+    remaining_df = pp["remaining_df"]
+
+    # ── Header banner ─────────────────────────────────────────────────────
+    st.markdown(
+        f"""
+        <div style="background:{PFC_NAVY};border-radius:14px;padding:14px 22px;
+            display:flex;align-items:center;gap:18px;margin-bottom:16px;">
+            <span style="font-size:2rem;">🏆</span>
+            <div>
+                <div style="color:{PFC_GOLD};font-weight:900;font-size:1.1rem;">
+                    Top 4 eligible teams advance to playoffs
+                </div>
+                <div style="color:{PFC_SILVER};font-size:0.85rem;margin-top:3px;">
+                    PSY T1 and PSY T2 are excluded from playoff contention &nbsp;·&nbsp;
+                    6 teams competing for 4 spots
+                </div>
+            </div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    # ── Team status chips ─────────────────────────────────────────────────
+    chip_cols = st.columns(len(eligible))
+
+    for i, row in projected.iterrows():
+        team = row["Team"]
+        proj_rank = int(row["Proj Rank"])
+        curr_pts = int(row["Current Pts"])
+        proj_pts = float(row["Projected Pts"])
+        remaining = int(row["Remaining Games"])
+
+        in_playoffs = proj_rank <= PLAYOFF_SPOTS
+
+        if team in clinched:
+            bg = f"linear-gradient(160deg, {PFC_GREEN} 0%, #1A5E35 100%)"
+            icon = "✅"
+            label = "CLINCHED"
+        elif team in eliminated:
+            bg = f"linear-gradient(160deg, {PFC_RED} 0%, #7B1A1A 100%)"
+            icon = "❌"
+            label = "OUT"
+        else:
+            bg = f"linear-gradient(160deg, {PFC_AMBER} 0%, #8A5A00 100%)"
+            icon = "🔥"
+            label = "BUBBLE"
+
+        border = f"3px solid {PFC_GOLD}" if in_playoffs else "3px solid rgba(255,255,255,0.15)"
+        rank_label = f"#{proj_rank} Projected"
+
+        chip_cols[i].markdown(
+            f"""
+            <div style="background:{bg};border:{border};border-radius:16px;
+                padding:16px 10px;text-align:center;margin:2px;
+                box-shadow:0 6px 18px rgba(0,0,0,.22);">
+                <div style="font-size:1.5rem;line-height:1;">{icon}</div>
+                <div style="font-weight:900;font-size:0.95rem;color:white;margin:6px 0 2px 0;
+                    letter-spacing:0.02em;">{team}</div>
+                <div style="font-size:0.78rem;color:rgba(255,255,255,0.75);">{rank_label}</div>
+                <div style="margin-top:8px;background:rgba(0,0,0,0.2);border-radius:8px;padding:5px 4px;">
+                    <div style="color:white;font-size:0.8rem;">
+                        <b>{curr_pts}</b> pts &rarr; <b style="color:{PFC_GOLD};">{proj_pts}</b>
+                    </div>
+                    <div style="color:rgba(255,255,255,0.65);font-size:0.72rem;">{remaining} games left</div>
+                </div>
+                <div style="margin-top:6px;background:rgba(255,255,255,0.15);border-radius:6px;
+                    padding:2px 6px;font-size:0.72rem;font-weight:900;color:white;">{label}</div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+
+    st.markdown("<div style='margin-top:16px;'></div>", unsafe_allow_html=True)
+
+    # ── Side-by-side standings + projected ───────────────────────────────
+    left_col, right_col = st.columns(2)
+
+    with left_col:
+        st.markdown(
+            f"<div style='font-weight:900;font-size:1rem;color:{PFC_NAVY};margin-bottom:10px;'>"
+            f"📊 Current Playoff Standing</div>",
+            unsafe_allow_html=True,
+        )
+        current = pp["current"].reset_index()
+
+        for _, row in current.iterrows():
+            rank = int(row["Playoff Rank"])
+            team = row["Team"]
+            pts = int(row["Pts"])
+            gd = int(row["GD"])
+            gp = int(row["GP"])
+            wdl = f"{int(row['W'])}W {int(row['D'])}D {int(row['L'])}L"
+
+            in_zone = rank <= PLAYOFF_SPOTS
+            bg = f"linear-gradient(90deg, {PFC_NAVY} 0%, {PFC_BLUE} 100%)" if in_zone else "linear-gradient(90deg, #3A3A4A, #555568)"
+            border_left = f"5px solid {PFC_GOLD}" if in_zone else f"5px solid {PFC_SILVER}"
+            zone_badge = (
+                f'<span style="background:{PFC_GOLD};color:{PFC_NAVY};font-size:0.68rem;'
+                f'font-weight:900;padding:2px 7px;border-radius:5px;margin-left:4px;">IN</span>'
+                if in_zone else
+                f'<span style="background:{PFC_SILVER};color:white;font-size:0.68rem;'
+                f'font-weight:900;padding:2px 7px;border-radius:5px;margin-left:4px;">OUT</span>'
+            )
+
+            divider = (
+                f'<div style="border-top:2px dashed {PFC_GOLD};margin:5px 0;opacity:0.5;"></div>'
+                if rank == PLAYOFF_SPOTS else ""
+            )
+
+            st.markdown(
+                f"""
+                <div style="background:{bg};border-left:{border_left};border-radius:10px;
+                    padding:11px 16px;margin:4px 0;display:flex;align-items:center;gap:10px;
+                    box-shadow:0 3px 10px rgba(0,0,0,.12);">
+                    <div style="color:{PFC_GOLD};font-weight:900;font-size:1.1rem;min-width:30px;">
+                        #{rank}
+                    </div>
+                    <div style="color:white;font-weight:800;flex:1;font-size:0.95rem;">{team}</div>
+                    <div style="color:rgba(255,255,255,0.65);font-size:0.75rem;">{wdl}</div>
+                    <div style="color:rgba(255,255,255,0.7);font-size:0.78rem;">GD {gd:+d}</div>
+                    <div style="color:{PFC_GOLD};font-weight:900;font-size:1rem;">{pts}pts</div>
+                    {zone_badge}
+                </div>
+                {divider}
+                """,
+                unsafe_allow_html=True,
+            )
+
+    with right_col:
+        st.markdown(
+            f"<div style='font-weight:900;font-size:1rem;color:{PFC_NAVY};margin-bottom:10px;'>"
+            f"🔮 Projected Final Standings</div>",
+            unsafe_allow_html=True,
+        )
+
+        for _, row in projected.iterrows():
+            rank = int(row["Proj Rank"])
+            team = row["Team"]
+            curr_pts = int(row["Current Pts"])
+            proj_pts = float(row["Projected Pts"])
+            remaining = int(row["Remaining Games"])
+
+            in_zone = rank <= PLAYOFF_SPOTS
+            bg = f"linear-gradient(90deg, {PFC_NAVY} 0%, {PFC_BLUE} 100%)" if in_zone else "linear-gradient(90deg, #3A3A4A, #555568)"
+            border_left = f"5px solid {PFC_GOLD}" if in_zone else f"5px solid {PFC_SILVER}"
+
+            if team in clinched:
+                status_chip = (
+                    f'<span style="background:{PFC_GREEN};color:white;font-size:0.68rem;'
+                    f'font-weight:900;padding:2px 7px;border-radius:5px;">CLINCHED</span>'
+                )
+            elif team in eliminated:
+                status_chip = (
+                    f'<span style="background:{PFC_RED};color:white;font-size:0.68rem;'
+                    f'font-weight:900;padding:2px 7px;border-radius:5px;">ELIM</span>'
+                )
+            else:
+                status_chip = (
+                    f'<span style="background:{PFC_AMBER};color:white;font-size:0.68rem;'
+                    f'font-weight:900;padding:2px 7px;border-radius:5px;">BUBBLE</span>'
+                )
+
+            divider = (
+                f'<div style="border-top:2px dashed {PFC_GOLD};margin:5px 0;opacity:0.5;"></div>'
+                if rank == PLAYOFF_SPOTS else ""
+            )
+
+            pts_trend = f"{curr_pts} → {proj_pts}"
+
+            st.markdown(
+                f"""
+                <div style="background:{bg};border-left:{border_left};border-radius:10px;
+                    padding:11px 16px;margin:4px 0;display:flex;align-items:center;gap:10px;
+                    box-shadow:0 3px 10px rgba(0,0,0,.12);">
+                    <div style="color:{PFC_GOLD};font-weight:900;font-size:1.1rem;min-width:30px;">#{rank}</div>
+                    <div style="color:white;font-weight:800;flex:1;font-size:0.95rem;">{team}</div>
+                    <div style="color:rgba(255,255,255,0.65);font-size:0.75rem;">{remaining}G left</div>
+                    <div style="color:white;font-size:0.82rem;">{pts_trend}</div>
+                    {status_chip}
+                </div>
+                {divider}
+                """,
+                unsafe_allow_html=True,
+            )
+
+    st.markdown("<div style='margin-top:16px;'></div>", unsafe_allow_html=True)
+
+    # ── Remaining head-to-head matchups ───────────────────────────────────
+    if not remaining_df.empty:
+        st.markdown(
+            f"<div style='font-weight:900;font-size:1rem;color:{PFC_NAVY};margin-bottom:8px;'>"
+            f"🗓️ Remaining Playoff-Relevant Matchups</div>",
+            unsafe_allow_html=True,
+        )
+        st.markdown(
+            f'<div class="info-strip">These are the remaining scheduled games between the 6 playoff-eligible teams. '
+            f'Every result directly shifts the playoff picture.</div>',
+            unsafe_allow_html=True,
+        )
+
+        for _, row in remaining_df.sort_values(["game_date", "time"]).iterrows():
+            h = row["home_team"]
+            a = row["away_team"]
+            date_str = format_display_date(row["game_date"])
+            time_str = row.get("time", "")
+            loc_str = row.get("location", "")
+            week_num = int(row["week"])
+
+            if h in clinched:
+                h_color = PFC_GREEN
+                h_tag = "✅"
+            elif h in eliminated:
+                h_color = PFC_RED
+                h_tag = "❌"
+            else:
+                h_color = PFC_AMBER
+                h_tag = "🔥"
+
+            if a in clinched:
+                a_color = PFC_GREEN
+                a_tag = "✅"
+            elif a in eliminated:
+                a_color = PFC_RED
+                a_tag = "❌"
+            else:
+                a_color = PFC_AMBER
+                a_tag = "🔥"
+
+            st.markdown(
+                f"""
+                <div style="background:white;border:1px solid #DCE5FF;border-radius:10px;
+                    padding:11px 18px;margin:5px 0;display:flex;align-items:center;gap:14px;
+                    box-shadow:0 2px 8px rgba(0,0,0,.05);">
+                    <div style="background:{PFC_NAVY};color:{PFC_GOLD};font-weight:900;
+                        font-size:0.8rem;padding:4px 10px;border-radius:8px;min-width:54px;
+                        text-align:center;">Wk {week_num}</div>
+                    <div style="color:#555;font-size:0.82rem;min-width:110px;">{date_str} {time_str}</div>
+                    <div style="font-weight:900;color:{h_color};flex:1;font-size:0.95rem;">
+                        {h_tag} {h}
+                    </div>
+                    <div style="color:{PFC_NAVY};font-weight:800;font-size:0.9rem;">vs</div>
+                    <div style="font-weight:900;color:{a_color};flex:1;text-align:right;font-size:0.95rem;">
+                        {a} {a_tag}
+                    </div>
+                    <div style="color:#999;font-size:0.78rem;min-width:58px;text-align:right;">{loc_str}</div>
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
+    else:
+        st.markdown(
+            f'<div class="info-strip">✅ All playoff-relevant matchups have been played.</div>',
+            unsafe_allow_html=True,
+        )
+
+    # ── Legend ────────────────────────────────────────────────────────────
+    st.markdown(
+        f"""
+        <div style="display:flex;gap:10px;margin-top:14px;flex-wrap:wrap;align-items:center;">
+            <span style="color:{PFC_DARK};font-weight:700;font-size:0.82rem;">Legend:</span>
+            <span style="background:{PFC_GREEN};color:white;padding:4px 12px;border-radius:8px;
+                font-size:0.78rem;font-weight:700;">✅ Clinched — mathematically in</span>
+            <span style="background:{PFC_AMBER};color:white;padding:4px 12px;border-radius:8px;
+                font-size:0.78rem;font-weight:700;">🔥 Bubble — still in contention</span>
+            <span style="background:{PFC_RED};color:white;padding:4px 12px;border-radius:8px;
+                font-size:0.78rem;font-weight:700;">❌ Eliminated — cannot qualify</span>
+            <span style="border:2px solid {PFC_GOLD};color:{PFC_NAVY};padding:4px 12px;border-radius:8px;
+                font-size:0.78rem;font-weight:700;">🏆 Gold border = projected playoff spot</span>
+        </div>
+        <div class="info-strip" style="margin-top:10px;">
+            <b>How projections work:</b> Projected pts use the same Elo + form + GD momentum model
+            as upcoming match predictions. Each remaining game is assigned probabilistic expected points
+            (win prob × 3 + draw prob × 1). These are estimates — not guarantees.
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+# ─────────────────────────────────────────────
 # DISPLAY HELPERS
 # ─────────────────────────────────────────────
 def form_badge_html(form_str: str) -> str:
@@ -1105,9 +1561,8 @@ def status_badge(status: str) -> str:
 
 
 def counts_for_badge(counts_for: str) -> str:
-    """Visual badge showing which teams the result counts for."""
     if counts_for == "Both Teams" or not counts_for:
-        return ""  # No badge needed — normal game
+        return ""
     if counts_for == "Home Only":
         return f'<span style="background:{PFC_PURPLE};color:white;padding:2px 8px;border-radius:6px;font-size:11px;font-weight:700;margin-left:6px;">HOME ONLY</span>'
     if counts_for == "Away Only":
@@ -1482,10 +1937,6 @@ def require_admin(label: str = "this action"):
 # COUNTS-FOR HELPER UI
 # ─────────────────────────────────────────────
 def counts_for_selector(key: str, default: str = "Both Teams", home_team: str = "", away_team: str = "") -> str:
-    """
-    Renders the 'Counts For' radio selector with a contextual explanation.
-    Returns the selected value.
-    """
     cf = st.radio(
         "Result counts for",
         COUNTS_OPTIONS,
@@ -1500,7 +1951,6 @@ def counts_for_selector(key: str, default: str = "Both Teams", home_team: str = 
         ),
     )
 
-    # Contextual explanation
     if cf == "Both Teams":
         st.markdown(
             f'<div class="counts-banner">✅ Normal game — result counts for <b>both</b> teams in standings.</div>',
@@ -1537,7 +1987,6 @@ def page_game_manager(df, division: str, teams: list[str]):
 
     sched_df = load_schedule_from_db(division)
 
-    # Build a lookup: (game_date, home_team, away_team) → match result row
     completed_map = {}
     for _, mr in df.iterrows():
         key = (str(mr["game_date"]), str(mr["home_team"]), str(mr["away_team"]))
@@ -1551,7 +2000,6 @@ def page_game_manager(df, division: str, teams: list[str]):
         "✏️ Edit / Delete Results",
     ])
 
-    # ── TAB 1: Schedule ───────────────────────────────────────────────────
     with tab_schedule:
         if sched_df.empty:
             st.info("No schedule loaded yet.")
@@ -1640,7 +2088,6 @@ def page_game_manager(df, division: str, teams: list[str]):
 
                                 sc1, sc2, sc3 = st.columns(3)
                                 with sc1:
-                                    # ── FIX: inputs OUTSIDE form so values update live ──
                                     hg = st.number_input(
                                         f"{row['home_team']} Goals",
                                         min_value=0, max_value=30, value=pre_hg, step=1,
@@ -1660,7 +2107,6 @@ def page_game_manager(df, division: str, teams: list[str]):
                                     )
 
                                 st.markdown("---")
-                                # Counts-for selector — OUTSIDE form
                                 cf_val = counts_for_selector(
                                     key=f"cf_{game_id}",
                                     default=pre_cf,
@@ -1669,7 +2115,6 @@ def page_game_manager(df, division: str, teams: list[str]):
                                 )
 
                                 st.markdown("---")
-                                # ── Save button (plain button, not form submit) ──
                                 if st.button("⚽ Save Score & Mark Played", key=f"save_score_{game_id}", use_container_width=True, type="primary"):
                                     if result_row is not None:
                                         update_match(
@@ -1731,7 +2176,6 @@ def page_game_manager(df, division: str, teams: list[str]):
 
             st.caption(f"Showing {len(view_df)} game(s).")
 
-    # ── TAB 2: Add New Game ───────────────────────────────────────────────
     with tab_add:
         if not require_admin("add games to the schedule"):
             st.stop()
@@ -1759,7 +2203,6 @@ def page_game_manager(df, division: str, teams: list[str]):
                 st.success(f"Added: {add_home} vs {add_away} — Week {add_week}, {format_display_date(add_date)} {add_time}")
                 st.rerun()
 
-    # ── TAB 3: Edit / Delete logged results ──────────────────────────────
     with tab_edit_results:
         if not require_admin("edit or delete match results"):
             st.stop()
@@ -1925,7 +2368,6 @@ def page_match_history(df, teams: list[str]):
     st.dataframe(display.reset_index(drop=True), width="stretch", hide_index=True)
     st.caption(f"Showing {len(display)} match(es)")
 
-    # Call out any partial-count games
     partial = display[display["Counts For"] != "Both Teams"]
     if not partial.empty:
         st.markdown(
@@ -2181,6 +2623,11 @@ def page_dashboard(df, division: str, teams: list[str]):
             c2.error(f"Biggest Faller: {faller[0]} ({faller[1]})")
         else:
             c2.info("Biggest Faller: No movement yet")
+
+    # ── Playoff Picture ───────────────────────────────────────────────────
+    if division == "U15 Boys":
+        st.divider()
+        render_playoff_picture(df, division, teams)
 
     st.markdown(
         f"""
