@@ -1130,7 +1130,11 @@ def compute_playoff_picture(df: pd.DataFrame, division: str, teams: list[str]):
         zip(df["game_date"].astype(str), df["home_team"].astype(str), df["away_team"].astype(str))
     ) if not df.empty else set()
 
+    # remaining_df = eligible vs eligible only (for head-to-head display and Monte Carlo)
+    # remaining_counts = ALL remaining games per eligible team (for "X games left" and max pts)
     remaining = []
+    remaining_counts = {t: 0 for t in eligible}
+
     if not sched_df.empty:
         for _, row in sched_df.iterrows():
             if row["status"] != "scheduled":
@@ -1138,19 +1142,17 @@ def compute_playoff_picture(df: pd.DataFrame, division: str, teams: list[str]):
             key = (str(row["game_date"]), str(row["home_team"]), str(row["away_team"]))
             if key in completed_keys:
                 continue
-            if row["home_team"] in eligible and row["away_team"] in eligible:
-                remaining.append(row)
-
-    remaining_df = pd.DataFrame(remaining) if remaining else pd.DataFrame()
-
-    remaining_counts = {t: 0 for t in eligible}
-    if not remaining_df.empty:
-        for _, row in remaining_df.iterrows():
             h, a = row["home_team"], row["away_team"]
+            # Count toward remaining games for any eligible team in the fixture
             if h in remaining_counts:
                 remaining_counts[h] += 1
             if a in remaining_counts:
                 remaining_counts[a] += 1
+            # Only add to head-to-head display if BOTH teams are eligible
+            if h in eligible and a in eligible:
+                remaining.append(row)
+
+    remaining_df = pd.DataFrame(remaining) if remaining else pd.DataFrame()
 
     current_pts = {row["Team"]: int(row["Pts"]) for _, row in eligible_standings.iterrows()}
     current_gd  = {row["Team"]: int(row["GD"]) for _, row in eligible_standings.iterrows()}
