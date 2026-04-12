@@ -378,15 +378,6 @@ def init_db():
     """)
     conn.commit()
 
-    already_purged = c.execute(
-        "SELECT value FROM meta WHERE key='demo_purged'"
-    ).fetchone()
-
-    if not already_purged:
-        c.execute("DELETE FROM matches")
-        c.execute("INSERT OR REPLACE INTO meta (key, value) VALUES ('demo_purged', '1')")
-        conn.commit()
-
     # Seed schedule table from SCHEDULE_ROWS if empty
     for division, rows in SCHEDULE_ROWS.items():
         count = c.execute(
@@ -2842,8 +2833,42 @@ def page_notes(division: str):
 def page_export(df, division: str, teams: list[str]):
     st.markdown('<div class="section-header">📥 Export Center</div>', unsafe_allow_html=True)
 
+    # ── Database backup — always available, regardless of match data ──────
+    st.markdown(
+        f"""
+        <div style="background:{PFC_NAVY};border-radius:12px;padding:14px 20px;
+            display:flex;align-items:center;gap:16px;margin-bottom:18px;">
+            <span style="font-size:1.8rem;">💾</span>
+            <div style="flex:1;">
+                <div style="color:{PFC_GOLD};font-weight:900;font-size:1rem;">Database Backup</div>
+                <div style="color:rgba(255,255,255,0.75);font-size:0.82rem;margin-top:2px;">
+                    Download a full copy of <b>league.db</b> before updating the app code.
+                    This preserves all match results, schedule status, and notes.
+                    Keep it in the same folder as the app to restore.
+                </div>
+            </div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+    try:
+        with open(DB_PATH, "rb") as f:
+            db_bytes = f.read()
+        st.download_button(
+            "💾 Download league.db Backup",
+            data=db_bytes,
+            file_name=f"league_backup_{datetime.now().strftime('%Y%m%d_%H%M')}.db",
+            mime="application/octet-stream",
+            use_container_width=True,
+            type="primary",
+        )
+    except Exception as e:
+        st.error(f"Could not read database file: {e}")
+
+    st.divider()
+
     if df.empty:
-        st.info("No data to export yet.")
+        st.info("No match data to export yet.")
         return
 
     standings = compute_standings(df, teams)
@@ -2949,6 +2974,12 @@ def main():
 
     st.sidebar.divider()
     st.sidebar.caption("Built for youth soccer league admins.")
+    st.sidebar.markdown(
+        f'<div style="background:rgba(212,175,55,0.18);border:1px solid {PFC_GOLD};'
+        f'border-radius:8px;padding:8px 10px;margin-top:6px;font-size:0.75rem;color:{PFC_GOLD};">'
+        f'💾 <b>Before updating the app</b>, go to Export and download a DB backup.</div>',
+        unsafe_allow_html=True,
+    )
 
     render_admin_sidebar()
 
