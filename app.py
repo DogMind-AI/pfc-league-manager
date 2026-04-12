@@ -2907,6 +2907,37 @@ def page_export(df, division: str, teams: list[str]):
     except Exception as e:
         st.error(f"Could not read database file: {e}")
 
+    # ── Admin only: clear all match results ──────────────────────────────
+    if is_admin():
+        st.divider()
+        st.markdown(
+            f"""
+            <div style="background:#3D0A0A;border:2px solid {PFC_RED};border-radius:12px;
+                padding:14px 20px;margin-bottom:6px;">
+                <div style="color:{PFC_RED};font-weight:900;font-size:1rem;">⚠️ Danger Zone — Clear All Match Results</div>
+                <div style="color:rgba(255,255,255,0.7);font-size:0.82rem;margin-top:4px;">
+                    Permanently deletes every result from the <b>{division}</b> division.
+                    Schedule, teams, and notes are NOT affected.
+                    <b>Download a backup above before using this.</b>
+                </div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+        confirm_clear = st.checkbox(
+            f"Yes, I want to permanently delete all {division} match results",
+            key="confirm_clear_results",
+        )
+        if confirm_clear:
+            if st.button("🗑️ Clear All Match Results", type="primary", use_container_width=True, key="clear_all_results_btn"):
+                conn = get_conn()
+                conn.execute("DELETE FROM matches WHERE division=?", (division,))
+                conn.commit()
+                conn.close()
+                st.session_state.pop("confirm_clear_results", None)
+                st.toast(f"🗑️ All {division} match results cleared.", icon="🗑️")
+                st.rerun()
+
     st.divider()
 
     if df.empty:
