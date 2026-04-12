@@ -1859,6 +1859,33 @@ def inject_css():
             color: white !important;
         }}
 
+        /* Admin login form — override the white-on-white problem */
+        [data-testid="stSidebar"] input[type="password"],
+        [data-testid="stSidebar"] input[type="text"] {{
+            color: {PFC_DARK} !important;
+            background-color: white !important;
+            border: 1px solid rgba(255,255,255,0.4) !important;
+            border-radius: 6px !important;
+        }}
+
+        [data-testid="stSidebar"] input[type="password"]::placeholder,
+        [data-testid="stSidebar"] input[type="text"]::placeholder {{
+            color: #888 !important;
+        }}
+
+        [data-testid="stSidebar"] .stFormSubmitButton button {{
+            background-color: {PFC_GOLD} !important;
+            color: {PFC_DARK} !important;
+            font-weight: 800 !important;
+            border: none !important;
+            border-radius: 8px !important;
+        }}
+
+        [data-testid="stSidebar"] .stFormSubmitButton button:hover {{
+            background-color: #C9A227 !important;
+            color: {PFC_DARK} !important;
+        }}
+
         [data-testid="stSidebar"] .stRadio label {{
             background: rgba(255,255,255,0.08);
             border: 1px solid rgba(255,255,255,0.15);
