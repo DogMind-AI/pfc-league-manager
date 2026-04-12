@@ -56,6 +56,21 @@ ADMIN_PASSWORD = "cobras2026"
 COUNTS_OPTIONS = ["Both Teams", "Home Only", "Away Only", "Neither"]
 
 # ─────────────────────────────────────────────
+# NON-PFC TEAMS — excluded from all ranking/analytics displays
+# Games against them still count toward PFC team standings.
+# ─────────────────────────────────────────────
+NON_PFC_TEAMS = {
+    "U15 Boys": ["PSY T1", "PSYT2"],
+    "U15 Girls": [],
+}
+
+def get_pfc_teams(division: str, all_teams: list[str]) -> list[str]:
+    """Return only PFC-affiliated teams for a division (excludes non-PFC opponents)."""
+    excluded = NON_PFC_TEAMS.get(division, [])
+    return [t for t in all_teams if t not in excluded]
+
+
+# ─────────────────────────────────────────────
 # PLAYOFF CONFIG
 # ─────────────────────────────────────────────
 PLAYOFF_ELIGIBLE_TEAMS = {
@@ -650,6 +665,11 @@ def weighted_last_n(values, weights=None):
 
 
 def compute_standings(df: pd.DataFrame, teams: list[str]) -> pd.DataFrame:
+    """
+    Compute standings for the given teams list only.
+    Games against non-listed teams (PSY T1, PSYT2) still award points to
+    the listed team — we just don't create a row for the non-listed team.
+    """
     records = {t: dict(GP=0, W=0, D=0, L=0, GF=0, GA=0, GD_capped=0, Pts=0) for t in teams}
 
     for _, row in df.iterrows():
@@ -670,6 +690,7 @@ def compute_standings(df: pd.DataFrame, teams: list[str]) -> pd.DataFrame:
         else:
             home_result, away_result = "D", "D"
 
+        # Only credit teams that are in our tracked list
         if home_counts and h in records:
             records[h]["GP"] += 1
             records[h]["GF"] += hg
@@ -740,12 +761,24 @@ def compute_standings_movement(df: pd.DataFrame, teams: list[str]) -> dict:
 
 
 def compute_power_package(df: pd.DataFrame, teams: list[str]):
-    elo = {t: 1500.0 for t in teams}
-    form_points = {t: [] for t in teams}
-    raw_gd = {t: [] for t in teams}
-    match_points = {t: [] for t in teams}
-    opp_pre_elo = {t: [] for t in teams}
-    results_text = {t: [] for t in teams}
+    """
+    Elo is computed using ALL teams in the match data (including PSY teams as opponents),
+    but only the teams in the `teams` list are returned in rankings/analytics rows.
+    This means Elo ratings for PFC teams correctly reflect games against PSY opponents.
+    """
+    # Collect all unique teams from match data to seed Elo (includes PSY as opponents)
+    all_match_teams = set()
+    if not df.empty:
+        all_match_teams.update(df["home_team"].tolist())
+        all_match_teams.update(df["away_team"].tolist())
+    all_match_teams.update(teams)
+
+    elo = {t: 1500.0 for t in all_match_teams}
+    form_points = {t: [] for t in all_match_teams}
+    raw_gd = {t: [] for t in all_match_teams}
+    match_points = {t: [] for t in all_match_teams}
+    opp_pre_elo = {t: [] for t in all_match_teams}
+    results_text = {t: [] for t in all_match_teams}
     match_logs = []
 
     sorted_df = df.sort_values(["week", "game_date", "id"]).reset_index(drop=True)
@@ -797,6 +830,7 @@ def compute_power_package(df: pd.DataFrame, teams: list[str]):
         if a in elo:
             elo[a] += delta_a
 
+        # Form/standings credit only to teams that count
         if home_counts and h in form_points:
             form_points[h].append(pts_h)
             match_points[h].append(pts_h)
@@ -838,6 +872,7 @@ def compute_power_package(df: pd.DataFrame, teams: list[str]):
             "Total Impact": round(abs(delta_h) + abs(delta_a), 2),
         })
 
+    # Build output rows for PFC teams only
     rows = []
     for team in teams:
         form_index = weighted_last_n(form_points[team], np.array([1, 2, 3, 4, 5], dtype=float))
@@ -999,15 +1034,33 @@ def compute_upcoming_predictions(df: pd.DataFrame, division: str, teams: list[st
     if upcoming.empty:
         return upcoming
 
+    # Only show upcoming games involving at least one PFC team
+    upcoming = upcoming[
+        upcoming["home_team"].isin(teams) | upcoming["away_team"].isin(teams)
+    ].copy()
+
+    if upcoming.empty:
+        return upcoming
+
     pr_map, analytics_map = compute_current_metrics(df, teams)
+
+    # Build a full Elo map including non-PFC teams as opponents
+    all_match_teams = set()
+    if not df.empty:
+        all_match_teams.update(df["home_team"].tolist())
+        all_match_teams.update(df["away_team"].tolist())
+    full_elo = {t: 1500.0 for t in all_match_teams}
+    # Use the elo from pr_map for PFC teams
+    for t, v in pr_map.items():
+        full_elo[t] = v.get("Elo Rating", 1500.0)
 
     records = []
     for _, row in upcoming.iterrows():
         home = row["home_team"]
         away = row["away_team"]
 
-        home_elo = pr_map.get(home, {}).get("Elo Rating", 1500.0)
-        away_elo = pr_map.get(away, {}).get("Elo Rating", 1500.0)
+        home_elo = pr_map.get(home, {}).get("Elo Rating", full_elo.get(home, 1500.0))
+        away_elo = pr_map.get(away, {}).get("Elo Rating", full_elo.get(away, 1500.0))
         home_form = analytics_map.get(home, {}).get("Form Index", 1.5)
         away_form = analytics_map.get(away, {}).get("Form Index", 1.5)
         home_gdm = analytics_map.get(home, {}).get("GD Momentum", 0.0)
@@ -1062,19 +1115,8 @@ def compute_upcoming_predictions(df: pd.DataFrame, division: str, teams: list[st
 # ─────────────────────────────────────────────
 
 def compute_playoff_picture(df: pd.DataFrame, division: str, teams: list[str]):
-    """
-    Returns playoff picture data:
-      - current: eligible teams ranked by current pts
-      - projected: eligible teams ranked by projected final pts
-      - clinched: teams mathematically guaranteed a spot
-      - eliminated: teams mathematically out
-      - bubble: everyone else
-      - remaining_games: dict of remaining game count per eligible team
-      - remaining_df: DataFrame of remaining head-to-head matchups
-    """
     eligible = PLAYOFF_ELIGIBLE_TEAMS.get(division, teams)
 
-    # Current standings filtered to eligible only
     full_standings = compute_standings(df, teams).reset_index()
     eligible_standings = full_standings[full_standings["Team"].isin(eligible)].copy()
     eligible_standings = eligible_standings.sort_values(
@@ -1083,7 +1125,6 @@ def compute_playoff_picture(df: pd.DataFrame, division: str, teams: list[str]):
     eligible_standings.index += 1
     eligible_standings.index.name = "Playoff Rank"
 
-    # Find remaining scheduled games between eligible teams only
     sched_df = load_schedule_from_db(division)
     completed_keys = set(
         zip(df["game_date"].astype(str), df["home_team"].astype(str), df["away_team"].astype(str))
@@ -1102,7 +1143,6 @@ def compute_playoff_picture(df: pd.DataFrame, division: str, teams: list[str]):
 
     remaining_df = pd.DataFrame(remaining) if remaining else pd.DataFrame()
 
-    # Count remaining games per team
     remaining_counts = {t: 0 for t in eligible}
     if not remaining_df.empty:
         for _, row in remaining_df.iterrows():
@@ -1113,13 +1153,13 @@ def compute_playoff_picture(df: pd.DataFrame, division: str, teams: list[str]):
                 remaining_counts[a] += 1
 
     current_pts = {row["Team"]: int(row["Pts"]) for _, row in eligible_standings.iterrows()}
+    current_gd  = {row["Team"]: int(row["GD"]) for _, row in eligible_standings.iterrows()}
+    current_gf  = {row["Team"]: int(row["GF"]) for _, row in eligible_standings.iterrows()}
     max_possible = {t: current_pts.get(t, 0) + remaining_counts[t] * 3 for t in eligible}
 
-    # Cutoff: what are the current top-4 pts
     sorted_pts = sorted(current_pts.values(), reverse=True)
     cutoff_pts = sorted_pts[PLAYOFF_SPOTS - 1] if len(sorted_pts) >= PLAYOFF_SPOTS else 0
 
-    # For clinched logic: what's the max the 5th-place team can reach?
     sorted_teams_by_pts = sorted(current_pts.items(), key=lambda x: x[1], reverse=True)
     if len(sorted_teams_by_pts) > PLAYOFF_SPOTS:
         fifth_team = sorted_teams_by_pts[PLAYOFF_SPOTS][0]
@@ -1135,22 +1175,19 @@ def compute_playoff_picture(df: pd.DataFrame, division: str, teams: list[str]):
         pts = current_pts.get(team, 0)
         max_pts = max_possible.get(team, 0)
 
-        # Clinched: current pts exceed what 5th place can max out at
         if len(sorted_teams_by_pts) > PLAYOFF_SPOTS and pts > fifth_max:
             clinched.append(team)
-        # Eliminated: even winning all remaining games can't reach 4th place pts
         elif max_pts < cutoff_pts:
             eliminated.append(team)
         else:
             bubble.append(team)
 
-    # Projected final points using probabilistic model
     pr, _, analytics = compute_power_package(df, teams)
     pr_map = pr.set_index("Team").to_dict(orient="index")
     analytics_map = analytics.set_index("Team").to_dict(orient="index")
 
-    projected_pts = {t: float(current_pts.get(t, 0)) for t in eligible}
-
+    # ── Build per-game win probabilities for remaining eligible matchups ──
+    game_probs = []  # list of (home, away, h_win_p, draw_p, a_win_p)
     if not remaining_df.empty:
         for _, row in remaining_df.iterrows():
             h, a = row["home_team"], row["away_team"]
@@ -1168,14 +1205,63 @@ def compute_playoff_picture(df: pd.DataFrame, division: str, teams: list[str]):
             blended_a = a_elo + (a_form - h_form) * 30 + (a_gdm - h_gdm) * 18
             diff = blended_h - blended_a
 
-            h_win_prob = 1 / (1 + 10 ** (-diff / 400))
-            a_win_prob = 1 - h_win_prob
-            draw_prob = 0.22
-            h_win_prob_adj = h_win_prob * (1 - draw_prob)
-            a_win_prob_adj = a_win_prob * (1 - draw_prob)
+            h_win_raw = 1 / (1 + 10 ** (-diff / 400))
+            draw_p = 0.22
+            h_win_p = h_win_raw * (1 - draw_p)
+            a_win_p = (1 - h_win_raw) * (1 - draw_p)
+            game_probs.append((h, a, h_win_p, draw_p, a_win_p))
 
-            projected_pts[h] = projected_pts.get(h, 0) + round(h_win_prob_adj * 3 + draw_prob * 1, 2)
-            projected_pts[a] = projected_pts.get(a, 0) + round(a_win_prob_adj * 3 + draw_prob * 1, 2)
+    # ── Monte Carlo: simulate season N times, count top-4 finishes ────────
+    N_SIMS = 2000
+    rng = np.random.default_rng(42)
+    playoff_counts = {t: 0 for t in eligible}
+
+    for _ in range(N_SIMS):
+        sim_pts = {t: current_pts.get(t, 0) for t in eligible}
+        sim_gd  = {t: current_gd.get(t, 0)  for t in eligible}
+        sim_gf  = {t: current_gf.get(t, 0)  for t in eligible}
+
+        for h, a, h_win_p, draw_p, a_win_p in game_probs:
+            r = rng.random()
+            if r < h_win_p:
+                sim_pts[h] += 3
+                # simulate a plausible scoreline for GD tiebreaker
+                goals = rng.integers(1, 4)
+                sim_gd[h] += goals; sim_gd[a] -= goals
+                sim_gf[h] += goals
+            elif r < h_win_p + draw_p:
+                sim_pts[h] += 1; sim_pts[a] += 1
+                goals = rng.integers(0, 3)
+                sim_gf[h] += goals; sim_gf[a] += goals
+            else:
+                sim_pts[a] += 3
+                goals = rng.integers(1, 4)
+                sim_gd[a] += goals; sim_gd[h] -= goals
+                sim_gf[a] += goals
+
+        # Rank by FIFA method: Pts → GD → GF → random tiebreak (alphabetical in real FIFA)
+        sim_order = sorted(
+            eligible,
+            key=lambda t: (sim_pts[t], sim_gd[t], sim_gf[t], rng.random()),
+            reverse=True,
+        )
+        for i, t in enumerate(sim_order):
+            if i < PLAYOFF_SPOTS:
+                playoff_counts[t] += 1
+
+    playoff_pct = {t: round(playoff_counts[t] / N_SIMS * 100, 1) for t in eligible}
+
+    # Override with 100% / 0% for mathematically decided teams
+    for t in clinched:
+        playoff_pct[t] = 100.0
+    for t in eliminated:
+        playoff_pct[t] = 0.0
+
+    # ── Projected pts (deterministic expected-value pass) ─────────────────
+    projected_pts = {t: float(current_pts.get(t, 0)) for t in eligible}
+    for h, a, h_win_p, draw_p, a_win_p in game_probs:
+        projected_pts[h] = projected_pts.get(h, 0) + round(h_win_p * 3 + draw_p * 1, 2)
+        projected_pts[a] = projected_pts.get(a, 0) + round(a_win_p * 3 + draw_p * 1, 2)
 
     projected_rows = []
     for team in eligible:
@@ -1192,6 +1278,7 @@ def compute_playoff_picture(df: pd.DataFrame, division: str, teams: list[str]):
             "Team": team,
             "Current Pts": curr,
             "Projected Pts": proj,
+            "Playoff %": playoff_pct.get(team, 0.0),
             "Remaining Games": remaining_counts.get(team, 0),
             "Max Possible Pts": max_possible.get(team, 0),
             "Status": status,
@@ -1211,19 +1298,17 @@ def compute_playoff_picture(df: pd.DataFrame, division: str, teams: list[str]):
         "bubble": bubble,
         "remaining_games": remaining_counts,
         "remaining_df": remaining_df,
+        "playoff_pct": playoff_pct,
     }
 
 
 def render_playoff_picture(df: pd.DataFrame, division: str, teams: list[str]):
-    """Renders the full playoff picture section inside the dashboard."""
-
     eligible = PLAYOFF_ELIGIBLE_TEAMS.get(division, [])
     if not eligible:
         return
 
     st.markdown('<div class="section-header">🏟️ Playoff Picture</div>', unsafe_allow_html=True)
 
-    # Early data gate — need at least some matches to project anything meaningful
     if df.empty:
         st.info("No match results logged yet. Playoff projections will appear once games are recorded.")
         return
@@ -1234,8 +1319,8 @@ def render_playoff_picture(df: pd.DataFrame, division: str, teams: list[str]):
     eliminated = pp["eliminated"]
     bubble = pp["bubble"]
     remaining_df = pp["remaining_df"]
+    playoff_pct = pp["playoff_pct"]
 
-    # ── Header banner ─────────────────────────────────────────────────────
     st.markdown(
         f"""
         <div style="background:{PFC_NAVY};border-radius:14px;padding:14px 22px;
@@ -1255,7 +1340,6 @@ def render_playoff_picture(df: pd.DataFrame, division: str, teams: list[str]):
         unsafe_allow_html=True,
     )
 
-    # ── Team status chips ─────────────────────────────────────────────────
     chip_cols = st.columns(len(eligible))
 
     for i, row in projected.iterrows():
@@ -1264,6 +1348,7 @@ def render_playoff_picture(df: pd.DataFrame, division: str, teams: list[str]):
         curr_pts = int(row["Current Pts"])
         proj_pts = float(row["Projected Pts"])
         remaining = int(row["Remaining Games"])
+        pct = playoff_pct.get(team, row.get("Playoff %", 0.0))
 
         in_playoffs = proj_rank <= PLAYOFF_SPOTS
 
@@ -1283,6 +1368,14 @@ def render_playoff_picture(df: pd.DataFrame, division: str, teams: list[str]):
         border = f"3px solid {PFC_GOLD}" if in_playoffs else "3px solid rgba(255,255,255,0.15)"
         rank_label = f"#{proj_rank} Projected"
 
+        # Playoff % bar fill color
+        if pct >= 75:
+            pct_color = PFC_GREEN
+        elif pct >= 40:
+            pct_color = PFC_AMBER
+        else:
+            pct_color = PFC_RED
+
         chip_cols[i].markdown(
             f"""
             <div style="background:{bg};border:{border};border-radius:16px;
@@ -1298,6 +1391,13 @@ def render_playoff_picture(df: pd.DataFrame, division: str, teams: list[str]):
                     </div>
                     <div style="color:rgba(255,255,255,0.65);font-size:0.72rem;">{remaining} games left</div>
                 </div>
+                <div style="margin-top:8px;background:rgba(0,0,0,0.25);border-radius:8px;padding:6px 6px 4px 6px;">
+                    <div style="color:rgba(255,255,255,0.7);font-size:0.68rem;margin-bottom:3px;">PLAYOFF ODDS</div>
+                    <div style="background:rgba(255,255,255,0.15);border-radius:5px;height:7px;overflow:hidden;margin-bottom:3px;">
+                        <div style="width:{min(pct,100):.0f}%;height:100%;background:{pct_color};border-radius:5px;"></div>
+                    </div>
+                    <div style="color:white;font-weight:900;font-size:1rem;">{pct:.0f}%</div>
+                </div>
                 <div style="margin-top:6px;background:rgba(255,255,255,0.15);border-radius:6px;
                     padding:2px 6px;font-size:0.72rem;font-weight:900;color:white;">{label}</div>
             </div>
@@ -1307,7 +1407,6 @@ def render_playoff_picture(df: pd.DataFrame, division: str, teams: list[str]):
 
     st.markdown("<div style='margin-top:16px;'></div>", unsafe_allow_html=True)
 
-    # ── Side-by-side standings + projected ───────────────────────────────
     left_col, right_col = st.columns(2)
 
     with left_col:
@@ -1374,6 +1473,7 @@ def render_playoff_picture(df: pd.DataFrame, division: str, teams: list[str]):
             curr_pts = int(row["Current Pts"])
             proj_pts = float(row["Projected Pts"])
             remaining = int(row["Remaining Games"])
+            pct = playoff_pct.get(team, row.get("Playoff %", 0.0))
 
             in_zone = rank <= PLAYOFF_SPOTS
             bg = f"linear-gradient(90deg, {PFC_NAVY} 0%, {PFC_BLUE} 100%)" if in_zone else "linear-gradient(90deg, #3A3A4A, #555568)"
@@ -1395,6 +1495,13 @@ def render_playoff_picture(df: pd.DataFrame, division: str, teams: list[str]):
                     f'font-weight:900;padding:2px 7px;border-radius:5px;">BUBBLE</span>'
                 )
 
+            if pct >= 75:
+                pct_color = PFC_GREEN
+            elif pct >= 40:
+                pct_color = PFC_AMBER
+            else:
+                pct_color = PFC_RED
+
             divider = (
                 f'<div style="border-top:2px dashed {PFC_GOLD};margin:5px 0;opacity:0.5;"></div>'
                 if rank == PLAYOFF_SPOTS else ""
@@ -1411,6 +1518,10 @@ def render_playoff_picture(df: pd.DataFrame, division: str, teams: list[str]):
                     <div style="color:white;font-weight:800;flex:1;font-size:0.95rem;">{team}</div>
                     <div style="color:rgba(255,255,255,0.65);font-size:0.75rem;">{remaining}G left</div>
                     <div style="color:white;font-size:0.82rem;">{pts_trend}</div>
+                    <div style="min-width:52px;text-align:right;">
+                        <span style="background:{pct_color};color:white;font-size:0.75rem;
+                            font-weight:900;padding:2px 7px;border-radius:5px;">{pct:.0f}%</span>
+                    </div>
                     {status_chip}
                 </div>
                 {divider}
@@ -1420,7 +1531,6 @@ def render_playoff_picture(df: pd.DataFrame, division: str, teams: list[str]):
 
     st.markdown("<div style='margin-top:16px;'></div>", unsafe_allow_html=True)
 
-    # ── Remaining head-to-head matchups ───────────────────────────────────
     if not remaining_df.empty:
         st.markdown(
             f"<div style='font-weight:900;font-size:1rem;color:{PFC_NAVY};margin-bottom:8px;'>"
@@ -1488,7 +1598,6 @@ def render_playoff_picture(df: pd.DataFrame, division: str, teams: list[str]):
             unsafe_allow_html=True,
         )
 
-    # ── Legend ────────────────────────────────────────────────────────────
     st.markdown(
         f"""
         <div style="display:flex;gap:10px;margin-top:14px;flex-wrap:wrap;align-items:center;">
@@ -1505,7 +1614,11 @@ def render_playoff_picture(df: pd.DataFrame, division: str, teams: list[str]):
         <div class="info-strip" style="margin-top:10px;">
             <b>How projections work:</b> Projected pts use the same Elo + form + GD momentum model
             as upcoming match predictions. Each remaining game is assigned probabilistic expected points
-            (win prob × 3 + draw prob × 1). These are estimates — not guarantees.
+            (win prob × 3 + draw prob × 1). These are estimates — not guarantees.<br>
+            <b>Playoff % methodology:</b> 2,000 season simulations run using Elo-derived win probabilities
+            for every remaining eligible matchup. Each sim applies the FIFA tiebreaker order (Pts → GD → GF)
+            to determine the top 4. The % reflects how often each team finishes in the top 4 across all sims.
+            Clinched teams show 100%, eliminated teams show 0%.
         </div>
         """,
         unsafe_allow_html=True,
@@ -2182,15 +2295,17 @@ def page_game_manager(df, division: str, teams: list[str]):
 
         st.markdown("Add a makeup game, extra fixture, or any game not on the schedule.")
 
+        # Use all_teams (including PSY) for game entry dropdowns so you can still log those results
+        all_teams = load_division_teams(division)
         a1, a2, a3 = st.columns(3)
         with a1:
             add_week = st.number_input("Week", min_value=1, max_value=52, value=1, step=1, key="ag_week")
             add_date = st.date_input("Date", value=date.today(), format="MM/DD/YYYY", key="ag_date")
         with a2:
-            add_home = st.selectbox("Home Team", teams, key="ag_home")
+            add_home = st.selectbox("Home Team", all_teams, key="ag_home")
             add_time = st.text_input("Time", value="9:00 AM", placeholder="e.g. 10:30 AM", key="ag_time")
         with a3:
-            add_away = st.selectbox("Away Team", teams, key="ag_away")
+            add_away = st.selectbox("Away Team", all_teams, key="ag_away")
             add_location = st.text_input("Location", value="", placeholder="e.g. Field 4", key="ag_loc")
 
         add_notes = st.text_input("Notes (optional)", placeholder="e.g. Makeup game from Week 3 cancellation", key="ag_notes")
@@ -2212,6 +2327,8 @@ def page_game_manager(df, division: str, teams: list[str]):
         else:
             st.markdown("Edit or delete a previously logged match result.")
 
+            # Use all_teams for editing dropdowns
+            all_teams = load_division_teams(division)
             manage_df = prep_match_display(df.copy())
             manage_df["Score"] = manage_df["home_goals"].astype(str) + "–" + manage_df["away_goals"].astype(str)
             display_list = manage_df[["id", "week", "game_date", "home_team", "Score", "away_team", "counts_for", "notes"]].copy()
@@ -2242,10 +2359,10 @@ def page_game_manager(df, division: str, teams: list[str]):
                 e_week = st.number_input("Week", min_value=1, max_value=52, value=int(sel["week"]), step=1, key="edit_week")
                 e_date = st.date_input("Date", value=parse_to_date(sel["game_date"]), format="MM/DD/YYYY", key="edit_date")
             with ec2:
-                e_home = st.selectbox("Home Team", teams, index=teams.index(sel["home_team"]) if sel["home_team"] in teams else 0, key="edit_home")
+                e_home = st.selectbox("Home Team", all_teams, index=all_teams.index(sel["home_team"]) if sel["home_team"] in all_teams else 0, key="edit_home")
                 e_hg = st.number_input("Home Goals", min_value=0, max_value=30, value=int(sel["home_goals"]), step=1, key="edit_hg")
             with ec3:
-                e_away = st.selectbox("Away Team", teams, index=teams.index(sel["away_team"]) if sel["away_team"] in teams else 0, key="edit_away")
+                e_away = st.selectbox("Away Team", all_teams, index=all_teams.index(sel["away_team"]) if sel["away_team"] in all_teams else 0, key="edit_away")
                 e_ag = st.number_input("Away Goals", min_value=0, max_value=30, value=int(sel["away_goals"]), step=1, key="edit_ag")
 
             e_notes = st.text_input("Notes", value=str(sel["notes"]), key="edit_notes")
@@ -2279,9 +2396,18 @@ def page_game_manager(df, division: str, teams: list[str]):
 
 def page_teams(division: str, teams: list[str]):
     st.markdown('<div class="section-header">👥 Team Management</div>', unsafe_allow_html=True)
+    # Use all teams (including PSY) for team management
+    all_teams = load_division_teams(division)
+
     if not require_admin("add or edit teams"):
         st.markdown("#### Current Teams")
-        st.dataframe(pd.DataFrame({"Team": sorted(teams)}), width="stretch", hide_index=True)
+        pfc_teams = get_pfc_teams(division, all_teams)
+        non_pfc = [t for t in all_teams if t not in pfc_teams]
+        st.markdown("**PFC Teams (included in rankings)**")
+        st.dataframe(pd.DataFrame({"Team": sorted(pfc_teams)}), width="stretch", hide_index=True)
+        if non_pfc:
+            st.markdown("**Opponents / Non-PFC (schedule only)**")
+            st.dataframe(pd.DataFrame({"Team": sorted(non_pfc)}), width="stretch", hide_index=True)
         return
 
     add_tab, edit_tab, delete_tab = st.tabs(["Add Team", "Edit Team Name", "Delete Team"])
@@ -2294,7 +2420,7 @@ def page_teams(division: str, teams: list[str]):
             new_team = new_team.strip()
             if not new_team:
                 st.error("Enter a team name.")
-            elif new_team in teams:
+            elif new_team in all_teams:
                 st.warning("That team already exists.")
             else:
                 add_team(division, new_team)
@@ -2302,18 +2428,18 @@ def page_teams(division: str, teams: list[str]):
                 st.rerun()
 
     with edit_tab:
-        if not teams:
+        if not all_teams:
             st.info("No teams found.")
         else:
             with st.form(f"rename_team_form_{division}"):
-                old_team = st.selectbox("Current Team Name", teams, key=f"old_team_{division}")
+                old_team = st.selectbox("Current Team Name", all_teams, key=f"old_team_{division}")
                 new_team_name = st.text_input("New Team Name")
                 rename_submitted = st.form_submit_button("✏️ Save Team Name Change", width="stretch")
             if rename_submitted:
                 new_team_name = new_team_name.strip()
                 if not new_team_name:
                     st.error("Enter a new team name.")
-                elif new_team_name in teams and new_team_name != old_team:
+                elif new_team_name in all_teams and new_team_name != old_team:
                     st.warning("That new team name already exists.")
                 else:
                     rename_team(division, old_team, new_team_name)
@@ -2321,11 +2447,11 @@ def page_teams(division: str, teams: list[str]):
                     st.rerun()
 
     with delete_tab:
-        if not teams:
+        if not all_teams:
             st.info("No teams found.")
         else:
             with st.form(f"delete_team_form_{division}"):
-                team_to_delete = st.selectbox("Team to Delete", teams, key=f"delete_team_{division}")
+                team_to_delete = st.selectbox("Team to Delete", all_teams, key=f"delete_team_{division}")
                 delete_submit = st.form_submit_button("🗑️ Delete Team", width="stretch")
             if delete_submit:
                 if can_delete_team(division, team_to_delete):
@@ -2336,7 +2462,13 @@ def page_teams(division: str, teams: list[str]):
                     st.error("This team already has matches logged. Delete the matches first or rename instead.")
 
     st.markdown("#### Current Teams")
-    st.dataframe(pd.DataFrame({"Team": sorted(teams)}), width="stretch", hide_index=True)
+    pfc_teams = get_pfc_teams(division, all_teams)
+    non_pfc = [t for t in all_teams if t not in pfc_teams]
+    st.markdown("**PFC Teams (included in rankings)**")
+    st.dataframe(pd.DataFrame({"Team": sorted(pfc_teams)}), width="stretch", hide_index=True)
+    if non_pfc:
+        st.markdown("**Opponents / Non-PFC (schedule only)**")
+        st.dataframe(pd.DataFrame({"Team": sorted(non_pfc)}), width="stretch", hide_index=True)
 
 
 def page_match_history(df, teams: list[str]):
@@ -2346,12 +2478,15 @@ def page_match_history(df, teams: list[str]):
         st.info("No matches recorded yet.")
         return
 
+    # Use all teams in history (PSY games show in history for reference)
+    all_teams_in_data = sorted(set(df["home_team"].tolist() + df["away_team"].tolist()))
+
     col1, col2 = st.columns(2)
     with col1:
         weeks = ["All"] + sorted(df["week"].unique().tolist())
         sel_week = st.selectbox("Filter by Week", weeks)
     with col2:
-        team_list = ["All"] + sorted(teams)
+        team_list = ["All"] + all_teams_in_data
         sel_team = st.selectbox("Filter by Team", team_list)
 
     filtered = df.copy()
@@ -2385,6 +2520,7 @@ def page_standings(df, teams: list[str]):
         <b>Official rules:</b> Win = 3 points, Draw = 1 point, Loss = 0 points.
         Goal differential is capped at <b>±4 per match</b> for standings only.
         Games marked "Home Only", "Away Only", or "Friendly" apply standings credit only to the applicable team(s).
+        <b>PSY T1 and PSY T2 are not ranked</b> — points earned against them count toward PFC team totals.
         </div>
         """,
         unsafe_allow_html=True,
@@ -2437,9 +2573,10 @@ def page_power_rankings(df, teams: list[str]):
     st.markdown(
         f"""
         <div class="info-strip">
-        <b>How power rankings work:</b> Not the same as official standings.
-        Power rankings use <b>Elo rating</b>, <b>strength of schedule</b>,
-        <b>weighted last-5 form index</b>, <b>goal differential momentum</b>, and <b>upset impact</b>.
+        <b>How power rankings work:</b> PFC teams only — PSY T1 and PSY T2 are excluded from rankings.
+        Rankings use <b>Elo rating</b> (which accounts for games against all opponents including PSY teams),
+        <b>strength of schedule</b>, <b>weighted last-5 form index</b>,
+        <b>goal differential momentum</b>, and <b>upset impact</b>.
         Elo always updates regardless of "Counts For" setting — because the game was played.
         Form and standings stats respect the "Counts For" setting.
         </div>
@@ -2521,21 +2658,24 @@ def page_dashboard(df, division: str, teams: list[str]):
 
     st.divider()
 
+    # ── Advanced Analytics Spotlight ────────────────────────────────────
     st.markdown("#### Advanced Analytics Spotlight")
-    c1, c2, c3, c4, c5 = st.columns(5)
+    c1, c2, c3, c4, c5, c6 = st.columns(6)
 
     best_attack = team_analytics.sort_values("GF/Game", ascending=False).iloc[0]
     best_defense = team_analytics.sort_values("GA/Game", ascending=True).iloc[0]
     toughest_sched = team_analytics.sort_values("Strength of Schedule", ascending=False).iloc[0]
+    easiest_sched = team_analytics.sort_values("Strength of Schedule", ascending=True).iloc[0]
     hottest_form = team_analytics.sort_values("Form Index", ascending=False).iloc[0]
     best_momentum = team_analytics.sort_values("GD Momentum", ascending=False).iloc[0]
 
     for col, label, team_row, stat, desc in [
         (c1, "Best Attack", best_attack, f'{best_attack["GF/Game"]} goals/game', "Highest goals scored per game."),
         (c2, "Best Defense", best_defense, f'{best_defense["GA/Game"]} allowed/game', "Fewest goals allowed per game."),
-        (c3, "Toughest Schedule", toughest_sched, f'SOS {toughest_sched["Strength of Schedule"]}', "Average Elo of opponents faced."),
-        (c4, "Best Form", hottest_form, f'Index {hottest_form["Form Index"]}', "Weighted last-5 performance."),
-        (c5, "Best Momentum", best_momentum, f'{best_momentum["GD Momentum"]}', "Recent scoring margin trend."),
+        (c3, "Toughest Schedule", toughest_sched, f'SOS {toughest_sched["Strength of Schedule"]}', "Highest avg opponent Elo faced."),
+        (c4, "Easiest Schedule", easiest_sched, f'SOS {easiest_sched["Strength of Schedule"]}', "Lowest avg opponent Elo faced."),
+        (c5, "Best Form", hottest_form, f'Index {hottest_form["Form Index"]}', "Weighted last-5 performance."),
+        (c6, "Best Momentum", best_momentum, f'{best_momentum["GD Momentum"]}', "Recent scoring margin trend."),
     ]:
         col.markdown(
             f'<div class="mini-card"><b>{label}</b><br><span style="font-size:1.1rem;font-weight:900;color:{PFC_NAVY};">{team_row["Team"]}</span><br>{stat}<div class="mini-label">{desc}</div></div>',
@@ -2633,6 +2773,8 @@ def page_dashboard(df, division: str, teams: list[str]):
         f"""
         <div class="info-strip">
         <b>Analytics notes:</b> Official standings use capped goal differential.
+        PSY T1 and PSY T2 appear in match history and schedule but are excluded from all rankings and analytics tables.
+        Points earned against PSY opponents count toward PFC team standings totals.
         Games with a partial "Counts For" setting apply credit only to the applicable team(s).
         Power rankings Elo always updates regardless of "Counts For" — because the game was played.
         </div>
@@ -2733,7 +2875,9 @@ def main():
     selected_division = st.sidebar.radio("Division", DIVISIONS, index=0, label_visibility="collapsed")
     st.sidebar.markdown(f'<div class="active-division-chip">Active: {selected_division}</div>', unsafe_allow_html=True)
 
-    teams = load_division_teams(selected_division)
+    # Load ALL teams (for schedule/game entry), then filter to PFC-only for analytics
+    all_teams = load_division_teams(selected_division)
+    pfc_teams = get_pfc_teams(selected_division, all_teams)
     df = load_matches(selected_division)
 
     render_header(selected_division)
@@ -2767,7 +2911,7 @@ def main():
         st.sidebar.divider()
         st.sidebar.markdown("**League Summary**")
         st.sidebar.caption(f"Division: **{selected_division}**")
-        st.sidebar.caption(f"Teams: **{len(teams)}**")
+        st.sidebar.caption(f"PFC Teams: **{len(pfc_teams)}**")
         st.sidebar.caption(f"Matches: **{len(df)}**")
         st.sidebar.caption(f"Weeks Logged: **{int(df['week'].max())}**")
         total_goals = int(df["home_goals"].sum() + df["away_goals"].sum())
@@ -2779,24 +2923,25 @@ def main():
 
     render_admin_sidebar()
 
+    # All analytics pages receive pfc_teams — PSY teams excluded from rankings
     if page == "📊 Dashboard":
-        page_dashboard(df, selected_division, teams)
+        page_dashboard(df, selected_division, pfc_teams)
     elif page == "📋 Game Manager":
-        page_game_manager(df, selected_division, teams)
+        page_game_manager(df, selected_division, all_teams)
     elif page == "👥 Teams":
-        page_teams(selected_division, teams)
+        page_teams(selected_division, pfc_teams)
     elif page == "📋 Match History":
-        page_match_history(df, teams)
+        page_match_history(df, pfc_teams)
     elif page == "🏆 Standings":
-        page_standings(df, teams)
+        page_standings(df, pfc_teams)
     elif page == "⚡ Power Rankings":
-        page_power_rankings(df, teams)
+        page_power_rankings(df, pfc_teams)
     elif page == "🔮 Upcoming Matches":
-        page_upcoming_matches(df, selected_division, teams)
+        page_upcoming_predictions(df, selected_division, pfc_teams)
     elif page == "📣 Notes":
         page_notes(selected_division)
     elif page == "📥 Export":
-        page_export(df, selected_division, teams)
+        page_export(df, selected_division, pfc_teams)
 
 
 if __name__ == "__main__":
