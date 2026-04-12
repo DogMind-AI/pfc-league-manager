@@ -113,6 +113,44 @@ def normalize_team_name(name):
     return TEAM_NAME_ALIASES.get(name, name)
 
 
+# ─────────────────────────────────────────────
+# KNOWN RESULTS — seeded on first run, never overwrites existing data
+# Add new results here and they'll be inserted automatically on next startup
+# if that exact (division, week, home_team, away_team) combo isn't already present.
+# ─────────────────────────────────────────────
+SEED_RESULTS = {
+    "U15 Boys": [
+        # Week 1
+        {"week": 1, "game_date": "2026-03-07", "home_team": "Athletico",  "away_team": "Cobras",   "home_goals": 2, "away_goals": 3, "counts_for": "Both Teams"},
+        {"week": 1, "game_date": "2026-03-07", "home_team": "Vipers",     "away_team": "PSY T1",   "home_goals": 4, "away_goals": 0, "counts_for": "Both Teams"},
+        {"week": 1, "game_date": "2026-03-07", "home_team": "Beavers",    "away_team": "PSYT2",    "home_goals": 3, "away_goals": 3, "counts_for": "Both Teams"},
+        {"week": 1, "game_date": "2026-03-07", "home_team": "Pelicans",   "away_team": "Los Locos","home_goals": 2, "away_goals": 7, "counts_for": "Both Teams"},
+        # Week 2
+        {"week": 2, "game_date": "2026-03-14", "home_team": "Beavers",    "away_team": "Pelicans", "home_goals": 6, "away_goals": 2, "counts_for": "Both Teams"},
+        {"week": 2, "game_date": "2026-03-14", "home_team": "Athletico",  "away_team": "PSY T1",   "home_goals": 2, "away_goals": 5, "counts_for": "Both Teams"},
+        # Week 3
+        {"week": 3, "game_date": "2026-03-20", "home_team": "Vipers",     "away_team": "Los Locos","home_goals": 0, "away_goals": 4, "counts_for": "Both Teams"},
+        {"week": 3, "game_date": "2026-03-21", "home_team": "Beavers",    "away_team": "Cobras",   "home_goals": 5, "away_goals": 1, "counts_for": "Both Teams"},
+        {"week": 3, "game_date": "2026-03-21", "home_team": "Pelicans",   "away_team": "PSYT2",    "home_goals": 1, "away_goals": 2, "counts_for": "Both Teams"},
+        {"week": 3, "game_date": "2026-03-21", "home_team": "Los Locos",  "away_team": "PSY T1",   "home_goals": 1, "away_goals": 8, "counts_for": "Both Teams"},
+        {"week": 3, "game_date": "2026-03-21", "home_team": "Vipers",     "away_team": "Athletico","home_goals": 6, "away_goals": 1, "counts_for": "Both Teams"},
+        # Week 4
+        {"week": 4, "game_date": "2026-04-03", "home_team": "Vipers",     "away_team": "Beavers",  "home_goals": 2, "away_goals": 6, "counts_for": "Both Teams"},
+        {"week": 4, "game_date": "2026-04-03", "home_team": "Athletico",  "away_team": "Los Locos","home_goals": 0, "away_goals": 4, "counts_for": "Both Teams"},
+        {"week": 4, "game_date": "2026-04-03", "home_team": "Pelicans",   "away_team": "Cobras",   "home_goals": 4, "away_goals": 2, "counts_for": "Both Teams"},
+        {"week": 4, "game_date": "2026-04-04", "home_team": "Cobras",     "away_team": "PSY T1",   "home_goals": 0, "away_goals": 4, "counts_for": "Both Teams"},
+        {"week": 4, "game_date": "2026-04-04", "home_team": "Los Locos",  "away_team": "PSYT2",    "home_goals": 4, "away_goals": 3, "counts_for": "Both Teams"},
+        {"week": 4, "game_date": "2026-04-04", "home_team": "Pelicans",   "away_team": "Vipers",   "home_goals": 4, "away_goals": 1, "counts_for": "Both Teams"},
+        {"week": 4, "game_date": "2026-04-04", "home_team": "Beavers",    "away_team": "Athletico","home_goals": 3, "away_goals": 3, "counts_for": "Both Teams"},
+        # Week 5
+        {"week": 5, "game_date": "2026-04-11", "home_team": "Cobras",     "away_team": "Los Locos","home_goals": 2, "away_goals": 0, "counts_for": "Both Teams"},
+        {"week": 5, "game_date": "2026-04-11", "home_team": "Beavers",    "away_team": "PSYT2",    "home_goals": 3, "away_goals": 3, "counts_for": "Both Teams"},
+        {"week": 5, "game_date": "2026-04-11", "home_team": "Athletico",  "away_team": "Pelicans", "home_goals": 4, "away_goals": 0, "counts_for": "Both Teams"},
+        {"week": 5, "game_date": "2026-04-11", "home_team": "Vipers",     "away_team": "PSY T1",   "home_goals": 3, "away_goals": 4, "counts_for": "Both Teams"},
+    ],
+    "U15 Girls": [],
+}
+
 SCHEDULE_ROWS = {
     "U15 Boys": [
         {"week": 1, "game_date": "2026-03-07", "home_team": "Vipers", "away_team": "PSY T1", "location": "Field 4", "time": "9:00 AM"},
@@ -402,6 +440,37 @@ def init_db():
                     ),
                 )
             conn.commit()
+
+    # Seed known match results — only inserts if that exact fixture isn't already present.
+    # Safe to run on every startup: never overwrites, never deletes.
+    for division, results in SEED_RESULTS.items():
+        for r in results:
+            existing = c.execute(
+                """
+                SELECT COUNT(*) FROM matches
+                WHERE division=? AND week=? AND home_team=? AND away_team=?
+                """,
+                (division, int(r["week"]), r["home_team"], r["away_team"]),
+            ).fetchone()[0]
+            if existing == 0:
+                c.execute(
+                    """
+                    INSERT INTO matches
+                        (division, week, game_date, home_team, away_team, home_goals, away_goals, notes, counts_for)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, '', ?)
+                    """,
+                    (
+                        division,
+                        int(r["week"]),
+                        to_iso_date(r["game_date"]),
+                        r["home_team"],
+                        r["away_team"],
+                        int(r["home_goals"]),
+                        int(r["away_goals"]),
+                        r.get("counts_for", "Both Teams"),
+                    ),
+                )
+        conn.commit()
 
     conn.close()
 
