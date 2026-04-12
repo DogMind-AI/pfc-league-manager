@@ -113,44 +113,6 @@ def normalize_team_name(name):
     return TEAM_NAME_ALIASES.get(name, name)
 
 
-# ─────────────────────────────────────────────
-# KNOWN RESULTS — seeded on first run, never overwrites existing data
-# Add new results here and they'll be inserted automatically on next startup
-# if that exact (division, week, home_team, away_team) combo isn't already present.
-# ─────────────────────────────────────────────
-SEED_RESULTS = {
-    "U15 Boys": [
-        # Week 1
-        {"week": 1, "game_date": "2026-03-07", "home_team": "Athletico",  "away_team": "Cobras",   "home_goals": 2, "away_goals": 3, "counts_for": "Both Teams"},
-        {"week": 1, "game_date": "2026-03-07", "home_team": "Vipers",     "away_team": "PSY T1",   "home_goals": 4, "away_goals": 0, "counts_for": "Both Teams"},
-        {"week": 1, "game_date": "2026-03-07", "home_team": "Beavers",    "away_team": "PSYT2",    "home_goals": 3, "away_goals": 3, "counts_for": "Both Teams"},
-        {"week": 1, "game_date": "2026-03-07", "home_team": "Pelicans",   "away_team": "Los Locos","home_goals": 2, "away_goals": 7, "counts_for": "Both Teams"},
-        # Week 2
-        {"week": 2, "game_date": "2026-03-14", "home_team": "Beavers",    "away_team": "Pelicans", "home_goals": 6, "away_goals": 2, "counts_for": "Both Teams"},
-        {"week": 2, "game_date": "2026-03-14", "home_team": "Athletico",  "away_team": "PSY T1",   "home_goals": 2, "away_goals": 5, "counts_for": "Both Teams"},
-        # Week 3
-        {"week": 3, "game_date": "2026-03-20", "home_team": "Vipers",     "away_team": "Los Locos","home_goals": 0, "away_goals": 4, "counts_for": "Both Teams"},
-        {"week": 3, "game_date": "2026-03-21", "home_team": "Beavers",    "away_team": "Cobras",   "home_goals": 5, "away_goals": 1, "counts_for": "Both Teams"},
-        {"week": 3, "game_date": "2026-03-21", "home_team": "Pelicans",   "away_team": "PSYT2",    "home_goals": 1, "away_goals": 2, "counts_for": "Both Teams"},
-        {"week": 3, "game_date": "2026-03-21", "home_team": "Los Locos",  "away_team": "PSY T1",   "home_goals": 1, "away_goals": 8, "counts_for": "Both Teams"},
-        {"week": 3, "game_date": "2026-03-21", "home_team": "Vipers",     "away_team": "Athletico","home_goals": 6, "away_goals": 1, "counts_for": "Both Teams"},
-        # Week 4
-        {"week": 4, "game_date": "2026-04-03", "home_team": "Vipers",     "away_team": "Beavers",  "home_goals": 2, "away_goals": 6, "counts_for": "Both Teams"},
-        {"week": 4, "game_date": "2026-04-03", "home_team": "Athletico",  "away_team": "Los Locos","home_goals": 0, "away_goals": 4, "counts_for": "Both Teams"},
-        {"week": 4, "game_date": "2026-04-03", "home_team": "Pelicans",   "away_team": "Cobras",   "home_goals": 4, "away_goals": 2, "counts_for": "Both Teams"},
-        {"week": 4, "game_date": "2026-04-04", "home_team": "Cobras",     "away_team": "PSY T1",   "home_goals": 0, "away_goals": 4, "counts_for": "Both Teams"},
-        {"week": 4, "game_date": "2026-04-04", "home_team": "Los Locos",  "away_team": "PSYT2",    "home_goals": 4, "away_goals": 3, "counts_for": "Both Teams"},
-        {"week": 4, "game_date": "2026-04-04", "home_team": "Pelicans",   "away_team": "Vipers",   "home_goals": 4, "away_goals": 1, "counts_for": "Both Teams"},
-        {"week": 4, "game_date": "2026-04-04", "home_team": "Beavers",    "away_team": "Athletico","home_goals": 3, "away_goals": 3, "counts_for": "Both Teams"},
-        # Week 5
-        {"week": 5, "game_date": "2026-04-11", "home_team": "Cobras",     "away_team": "Los Locos","home_goals": 2, "away_goals": 0, "counts_for": "Both Teams"},
-        {"week": 5, "game_date": "2026-04-11", "home_team": "Beavers",    "away_team": "PSYT2",    "home_goals": 3, "away_goals": 3, "counts_for": "Both Teams"},
-        {"week": 5, "game_date": "2026-04-11", "home_team": "Athletico",  "away_team": "Pelicans", "home_goals": 4, "away_goals": 0, "counts_for": "Both Teams"},
-        {"week": 5, "game_date": "2026-04-11", "home_team": "Vipers",     "away_team": "PSY T1",   "home_goals": 3, "away_goals": 4, "counts_for": "Both Teams"},
-    ],
-    "U15 Girls": [],
-}
-
 SCHEDULE_ROWS = {
     "U15 Boys": [
         {"week": 1, "game_date": "2026-03-07", "home_team": "Vipers", "away_team": "PSY T1", "location": "Field 4", "time": "9:00 AM"},
@@ -441,37 +403,6 @@ def init_db():
                 )
             conn.commit()
 
-    # Seed known match results — only inserts if that exact fixture isn't already present.
-    # Safe to run on every startup: never overwrites, never deletes.
-    for division, results in SEED_RESULTS.items():
-        for r in results:
-            existing = c.execute(
-                """
-                SELECT COUNT(*) FROM matches
-                WHERE division=? AND week=? AND home_team=? AND away_team=?
-                """,
-                (division, int(r["week"]), r["home_team"], r["away_team"]),
-            ).fetchone()[0]
-            if existing == 0:
-                c.execute(
-                    """
-                    INSERT INTO matches
-                        (division, week, game_date, home_team, away_team, home_goals, away_goals, notes, counts_for)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, '', ?)
-                    """,
-                    (
-                        division,
-                        int(r["week"]),
-                        to_iso_date(r["game_date"]),
-                        r["home_team"],
-                        r["away_team"],
-                        int(r["home_goals"]),
-                        int(r["away_goals"]),
-                        r.get("counts_for", "Both Teams"),
-                    ),
-                )
-        conn.commit()
-
     conn.close()
 
 
@@ -531,7 +462,15 @@ def load_matches(division: str) -> pd.DataFrame:
         conn,
         params=(division,),
     )
+    # Cross-reference schedule: exclude any result whose schedule row is canceled or bye.
+    # A match with no corresponding schedule row is kept (manually added games).
+    sched = pd.read_sql_query(
+        "SELECT game_date, home_team, away_team, status FROM schedule WHERE division=?",
+        conn,
+        params=(division,),
+    )
     conn.close()
+
     if not df.empty:
         df["game_date"] = df["game_date"].astype(str)
         df["home_team"] = df["home_team"].apply(normalize_team_name)
@@ -539,6 +478,26 @@ def load_matches(division: str) -> pd.DataFrame:
         if "counts_for" not in df.columns:
             df["counts_for"] = "Both Teams"
         df["counts_for"] = df["counts_for"].fillna("Both Teams")
+
+        if not sched.empty:
+            sched["game_date"] = sched["game_date"].astype(str)
+            sched["home_team"] = sched["home_team"].apply(normalize_team_name)
+            sched["away_team"] = sched["away_team"].apply(normalize_team_name)
+            # Build a set of (date, home, away) keys that are canceled or bye
+            excluded_keys = set(
+                zip(
+                    sched.loc[sched["status"].isin(["canceled", "bye"]), "game_date"],
+                    sched.loc[sched["status"].isin(["canceled", "bye"]), "home_team"],
+                    sched.loc[sched["status"].isin(["canceled", "bye"]), "away_team"],
+                )
+            )
+            if excluded_keys:
+                mask = df.apply(
+                    lambda r: (r["game_date"], r["home_team"], r["away_team"]) not in excluded_keys,
+                    axis=1,
+                )
+                df = df[mask].reset_index(drop=True)
+
     return df
 
 
@@ -726,9 +685,17 @@ def weighted_last_n(values, weights=None):
 
 def compute_standings(df: pd.DataFrame, teams: list[str]) -> pd.DataFrame:
     """
-    Compute standings for the given teams list only.
-    Games against non-listed teams (PSY T1, PSYT2) still award points to
-    the listed team — we just don't create a row for the non-listed team.
+    Compute standings for PFC teams only.
+
+    Rules:
+    - Games against non-PFC opponents (PSY T1, PSYT2) still award pts/GP/GF/GA
+      to the PFC team — the opponent just has no standings row.
+    - counts_for controls which side(s) get standings credit:
+        Both Teams  → both teams get GP, W/D/L, GF, GA, Pts
+        Home Only   → only home team gets any standings credit; away team gets nothing
+        Away Only   → only away team gets any standings credit; home team gets nothing
+        Neither     → no standings impact for either team (friendly/exhibition)
+    - Canceled and bye games are already excluded from df by load_matches().
     """
     records = {t: dict(GP=0, W=0, D=0, L=0, GF=0, GA=0, GD_capped=0, Pts=0) for t in teams}
 
@@ -750,7 +717,7 @@ def compute_standings(df: pd.DataFrame, teams: list[str]) -> pd.DataFrame:
         else:
             home_result, away_result = "D", "D"
 
-        # Only credit teams that are in our tracked list
+        # GP, GF, GA, W/D/L and Pts only credited when counts_for applies to that side
         if home_counts and h in records:
             records[h]["GP"] += 1
             records[h]["GF"] += hg
@@ -2270,7 +2237,8 @@ def page_game_manager(df, division: str, teams: list[str]):
                     )
 
                     if admin:
-                        with st.expander(f"⚙️ Actions — {row['home_team']} vs {row['away_team']} (Wk {int(row['week'])})", expanded=False):
+                        is_open = st.session_state.get("gm_open_expander") == game_id
+                        with st.expander(f"⚙️ Actions — {row['home_team']} vs {row['away_team']} (Wk {int(row['week'])})", expanded=is_open):
                             action = st.radio(
                                 "What do you want to do?",
                                 ["⚽ Enter / Update Score", "🗓️ Reschedule", "🚫 Cancel", "😴 Mark as Bye", "♻️ Restore to Scheduled"],
@@ -2332,7 +2300,8 @@ def page_game_manager(df, division: str, teams: list[str]):
                                             hg, ag, match_notes, cf_val,
                                         )
                                     set_game_status(game_id, "played", "")
-                                    st.success(f"✅ Saved: {row['home_team']} {hg} – {ag} {row['away_team']} ({cf_val})")
+                                    st.session_state.pop("gm_open_expander", None)
+                                    st.toast(f"✅ Saved: {row['home_team']} {hg} – {ag} {row['away_team']}", icon="⚽")
                                     st.rerun()
 
                             elif action == "🗓️ Reschedule":
@@ -2350,7 +2319,8 @@ def page_game_manager(df, division: str, teams: list[str]):
 
                                 if save_rs:
                                     update_schedule_game(game_id, new_week, new_date, row["home_team"], row["away_team"], new_loc, new_time, "scheduled", rs_notes)
-                                    st.success(f"Rescheduled to Week {new_week}, {format_display_date(new_date)} {new_time} @ {new_loc}")
+                                    st.session_state.pop("gm_open_expander", None)
+                                    st.toast(f"📅 Rescheduled: Wk {new_week}, {format_display_date(new_date)} {new_time}", icon="📅")
                                     st.rerun()
 
                             elif action == "🚫 Cancel":
@@ -2358,7 +2328,8 @@ def page_game_manager(df, division: str, teams: list[str]):
                                     cancel_reason = st.text_input("Reason (optional)", placeholder="e.g. Field closed, weather", key=f"cancelreason_{game_id}")
                                     if st.form_submit_button("🚫 Confirm Cancellation", use_container_width=True):
                                         set_game_status(game_id, "canceled", cancel_reason)
-                                        st.success(f"Marked as Canceled: {row['home_team']} vs {row['away_team']}")
+                                        st.session_state.pop("gm_open_expander", None)
+                                        st.toast(f"🚫 Canceled: {row['home_team']} vs {row['away_team']}", icon="🚫")
                                         st.rerun()
 
                             elif action == "😴 Mark as Bye":
@@ -2366,14 +2337,16 @@ def page_game_manager(df, division: str, teams: list[str]):
                                     bye_notes = st.text_input("Notes (optional)", placeholder="e.g. Opponent no-show", key=f"byenotes_{game_id}")
                                     if st.form_submit_button("😴 Confirm Bye", use_container_width=True):
                                         set_game_status(game_id, "bye", bye_notes)
-                                        st.success(f"Marked as Bye: {row['home_team']} vs {row['away_team']}")
+                                        st.session_state.pop("gm_open_expander", None)
+                                        st.toast(f"😴 Bye: {row['home_team']} vs {row['away_team']}", icon="😴")
                                         st.rerun()
 
                             elif action == "♻️ Restore to Scheduled":
                                 with st.form(f"restore_form_{game_id}"):
                                     if st.form_submit_button("♻️ Restore to Scheduled", use_container_width=True):
                                         set_game_status(game_id, "scheduled", "")
-                                        st.success(f"Restored: {row['home_team']} vs {row['away_team']}")
+                                        st.session_state.pop("gm_open_expander", None)
+                                        st.toast(f"♻️ Restored: {row['home_team']} vs {row['away_team']}", icon="♻️")
                                         st.rerun()
 
             st.caption(f"Showing {len(view_df)} game(s).")
